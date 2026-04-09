@@ -51,7 +51,14 @@
 }
 
 body {
-  margin: 0;
+  margin: 0 auto;
+  max-width: 1024px;
+  display: flex;
+}
+
+#graph {
+  flex: 1 1 auto;
+  width: 100%;
 }
 
 h1,
