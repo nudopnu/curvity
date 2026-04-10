@@ -65,6 +65,8 @@ export type GraphConfig = {
     showYAxis: boolean;
     yAxisWidth: number;
     rulerHeight: number;
+    showSidebar: boolean;
+    sidebarWidth: number;
 };
 
 export type GraphState = {
@@ -82,6 +84,7 @@ export type GraphState = {
     drag?: GraphDragState;
     hover?: GraphHoverState;
     selection: SelectionItem[];
+    hiddenCurves: Set<number>;
     data: GraphData;
 };
 
@@ -90,6 +93,8 @@ export const DEFAULT_GRAPH_CONFIG: GraphConfig = {
     showYAxis: true,
     yAxisWidth: 44,
     rulerHeight: 20,
+    showSidebar: true,
+    sidebarWidth: 140,
 };
 
 // ─── Sample data ──────────────────────────────────────────────────────────────
@@ -164,6 +169,7 @@ export class Graph {
             valueOffset: -6,
             playHead: 0,
             selection: [],
+            hiddenCurves: new Set(),
             data,
         };
 
@@ -186,11 +192,11 @@ export class Graph {
     // ─── Coordinate transforms ────────────────────────────────────────────────
 
     public timeToX(time: number): number {
-        return this.config.yAxisWidth + (time - this.state.timeOffset) * this.state.timeScale;
+        return this._chartLeft() + (time - this.state.timeOffset) * this.state.timeScale;
     }
 
     public xToTime(x: number): number {
-        return (x - this.config.yAxisWidth) / this.state.timeScale + this.state.timeOffset;
+        return (x - this._chartLeft()) / this.state.timeScale + this.state.timeOffset;
     }
 
     public valueToY(value: number): number {
@@ -207,16 +213,20 @@ export class Graph {
         return this.state.svgHeight - this.config.rulerHeight;
     }
 
+    private _chartLeft(): number {
+        const sb = this.config.showSidebar ? this.config.sidebarWidth : 0;
+        return sb + (this.config.showYAxis ? this.config.yAxisWidth : 0);
+    }
+
     private _chartArea() {
-        return { left: this.config.yAxisWidth, right: this.state.svgWidth, top: 0, bottom: this._chartBottom() };
+        return { left: this._chartLeft(), right: this.state.svgWidth, top: 0, bottom: this._chartBottom() };
     }
 
     private _rulerDims() {
-        const { rulerHeight, yAxisWidth, showYAxis } = this.config;
+        const { rulerHeight } = this.config;
         const { svgWidth, svgHeight } = this.state;
         const top = svgHeight - rulerHeight;
-        const left = showYAxis ? yAxisWidth : 0;
-        return { top, bottom: svgHeight, left, right: svgWidth, height: rulerHeight };
+        return { top, bottom: svgHeight, left: this._chartLeft(), right: svgWidth, height: rulerHeight };
     }
 
     // ─── Tangent computation ──────────────────────────────────────────────────
@@ -321,6 +331,7 @@ export class Graph {
         if (this.config.showRuler) this._drawRuler();
         if (this.state.drag?.type === "marquee") this._drawMarquee();
         this._drawPlayhead();
+        if (this.config.showSidebar) this._drawSidebar();
     }
 
     private _addClipPath() {
@@ -371,24 +382,69 @@ export class Graph {
 
     private _drawYAxis() {
         const { yAxisWidth } = this.config;
+        const sb = this.config.showSidebar ? this.config.sidebarWidth : 0;
+        const axisX = sb;
         const chart = this._chartArea();
-        this._el("rect", { x: 0, y: chart.top, width: yAxisWidth, height: chart.bottom - chart.top, fill: "#141b26" });
+        this._el("rect", { x: axisX, y: chart.top, width: yAxisWidth, height: chart.bottom - chart.top, fill: "#141b26" });
 
         const topVal = this.yToValue(chart.top), botVal = this.yToValue(chart.bottom);
         const vStep = this._niceValueStep((topVal - botVal) / 8);
         for (let v = Math.ceil(botVal / vStep) * vStep; v <= topVal + 1e-9; v += vStep) {
             const y = this.valueToY(v);
             if (y < chart.top + 5 || y > chart.bottom - 3) continue;
-            this._el("line", { x1: yAxisWidth - 3, y1: y, x2: yAxisWidth, y2: y, stroke: "#3a4a60", "stroke-width": 1 });
+            this._el("line", { x1: axisX + yAxisWidth - 3, y1: y, x2: axisX + yAxisWidth, y2: y, stroke: "#3a4a60", "stroke-width": 1 });
             const label = Math.abs(v) < vStep * 0.001 ? "0"
                 : Math.abs(v) >= 10 ? v.toFixed(0)
                 : v.toPrecision(2).replace(/\.?0+$/, "");
             this._el("text", {
-                x: yAxisWidth - 5, y: y + 3.5,
+                x: axisX + yAxisWidth - 5, y: y + 3.5,
                 fill: "#4a5a70", "font-size": 9, "text-anchor": "end", "font-family": "system-ui,sans-serif",
             }, label);
         }
-        this._el("line", { x1: yAxisWidth, y1: chart.top, x2: yAxisWidth, y2: chart.bottom, stroke: "#263040", "stroke-width": 1 });
+        this._el("line", { x1: axisX + yAxisWidth, y1: chart.top, x2: axisX + yAxisWidth, y2: chart.bottom, stroke: "#263040", "stroke-width": 1 });
+    }
+
+    private _drawSidebar() {
+        const { sidebarWidth, data } = { ...this.config, data: this.state.data };
+        const { svgHeight } = this.state;
+        const ROW_H = 24, START_Y = 30;
+
+        this._el("rect", { x: 0, y: 0, width: sidebarWidth, height: svgHeight, fill: "#111720" });
+        this._el("line", { x1: sidebarWidth, y1: 0, x2: sidebarWidth, y2: svgHeight, stroke: "#1e2d40", "stroke-width": 1 });
+
+        this._el("text", { x: 10, y: 16, fill: "#3a4a5a", "font-size": 9, "font-family": "system-ui,sans-serif", "font-weight": "600", "letter-spacing": "1" }, "CURVES");
+        this._el("line", { x1: 0, y1: 22, x2: sidebarWidth, y2: 22, stroke: "#1a2535", "stroke-width": 1 });
+
+        for (let ci = 0; ci < data.curves.length; ci++) {
+            const curve = data.curves[ci];
+            const visible = !this.state.hiddenCurves.has(ci);
+            const isKfSel = this.state.selection.some(s => s.curveIdx === ci);
+            const ry = START_Y + ci * ROW_H;
+
+            // Row highlight if curve has selection
+            if (isKfSel)
+                this._el("rect", { x: 0, y: ry - 1, width: sidebarWidth, height: ROW_H, fill: "#1a2840" });
+
+            // Color swatch
+            this._el("rect", { x: 8, y: ry + 7, width: 10, height: 10, rx: 2, fill: visible ? curve.color : "#2a3040" });
+
+            // Name
+            this._el("text", {
+                x: 24, y: ry + 16,
+                fill: visible ? "#b0bcc8" : "#3a4a5a",
+                "font-size": 11, "font-family": "system-ui,sans-serif",
+            }, curve.name);
+
+            // Eye icon
+            const ex = sidebarWidth - 14, ey = ry + 12;
+            if (visible) {
+                this._el("ellipse", { cx: ex, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#4a5a70", "stroke-width": 1.2 });
+                this._el("circle", { cx: ex, cy: ey, r: 1.8, fill: "#4a5a70" });
+            } else {
+                this._el("ellipse", { cx: ex, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#2a3a4a", "stroke-width": 1.2 });
+                this._el("line", { x1: ex - 6, y1: ey - 4, x2: ex + 6, y2: ey + 4, stroke: "#2a3a4a", "stroke-width": 1.5 });
+            }
+        }
     }
 
     private _drawCurves() {
@@ -396,6 +452,7 @@ export class Graph {
         const chart = this._chartArea();
 
         for (let ci = 0; ci < data.curves.length; ci++) {
+            if (this.state.hiddenCurves.has(ci)) continue;
             const curve = data.curves[ci];
             const kfs = curve.keyframes;
             if (kfs.length === 0) continue;
@@ -438,6 +495,7 @@ export class Graph {
         const R = 4.5;
 
         for (let ci = 0; ci < data.curves.length; ci++) {
+            if (this.state.hiddenCurves.has(ci)) continue;
             const curve = data.curves[ci];
             for (let ki = 0; ki < curve.keyframes.length; ki++) {
                 const kf = curve.keyframes[ki];
@@ -462,6 +520,7 @@ export class Graph {
         const HR = 3.5;
 
         for (let ci = 0; ci < data.curves.length; ci++) {
+            if (this.state.hiddenCurves.has(ci)) continue;
             const curve = data.curves[ci];
             for (let ki = 0; ki < curve.keyframes.length; ki++) {
                 if (!this._hasHandleVisible(ci, ki)) continue;
@@ -576,6 +635,18 @@ export class Graph {
                 e.preventDefault();
                 this.state.drag = { type: "pan", startX: x, startY: y, startTimeOffset: this.state.timeOffset, startValueOffset: this.state.valueOffset };
                 this.svg.style.cursor = "grabbing";
+                return;
+            }
+
+            // Sidebar click → toggle curve visibility
+            if (this.config.showSidebar && x >= 0 && x <= this.config.sidebarWidth && e.button === 0) {
+                const ROW_H = 24, START_Y = 30;
+                const ci = Math.floor((y - START_Y) / ROW_H);
+                if (ci >= 0 && ci < this.state.data.curves.length) {
+                    if (this.state.hiddenCurves.has(ci)) this.state.hiddenCurves.delete(ci);
+                    else this.state.hiddenCurves.add(ci);
+                    this.redraw();
+                }
                 return;
             }
 
