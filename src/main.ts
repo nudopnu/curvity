@@ -3,4 +3,5 @@ import { Graph } from './graph.ts'
 
 
 const container = document.querySelector<HTMLElement>("#graph")!;
-new Graph(container);
+const graph = new Graph(container);
+console.log(graph.state.data);

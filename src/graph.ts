@@ -46,7 +46,14 @@ export type GraphDragState =
           entries: { curveIdx: number; kfIdx: number; kfRef: GraphKeyframe; origTime: number; origValue: number }[];
           axisLock?: "x" | "y";
       }
-    | { type: "moveTangent"; curveIdx: number; kfIdx: number; side: "in" | "out"; unified: boolean };
+    | { type: "moveTangent"; curveIdx: number; kfIdx: number; side: "in" | "out"; unified: boolean }
+    | {
+          type: "zoom";
+          startX: number; startY: number;
+          startTimeScale: number; startValueScale: number;
+          startTimeOffset: number; startValueOffset: number;
+          pivotTime: number; pivotValue: number;
+      };
 
 export type GraphHoverState =
     | { type: "playhead" }
@@ -348,8 +355,8 @@ export class Graph {
             const isZero = Math.abs(v) < vStep * 0.01;
             this._el("line", {
                 x1: chart.left, y1: y, x2: chart.right, y2: y,
-                stroke: isZero ? "#263550" : "#1a2535",
-                "stroke-width": isZero ? 1.5 : 0.5,
+                stroke: isZero ? "#2e4a6e" : "#1e2d40",
+                "stroke-width": isZero ? 1.5 : 1,
             });
         }
 
@@ -358,7 +365,7 @@ export class Graph {
         const tStep = this._niceTimeStep(tRange / 8);
         for (let t = Math.ceil(this.xToTime(chart.left) / tStep) * tStep; t <= this.xToTime(chart.right) + 1e-9; t += tStep) {
             const x = this.timeToX(t);
-            this._el("line", { x1: x, y1: chart.top, x2: x, y2: chart.bottom, stroke: "#1a2535", "stroke-width": 0.5 });
+            this._el("line", { x1: x, y1: chart.top, x2: x, y2: chart.bottom, stroke: "#1e2d40", "stroke-width": 1 });
         }
     }
 
@@ -524,6 +531,8 @@ export class Graph {
     // ─── Event setup ──────────────────────────────────────────────────────────
 
     private _setupEvents() {
+        this.svg.addEventListener("contextmenu", e => e.preventDefault());
+
         this.svg.addEventListener("wheel", e => {
             e.preventDefault();
             const { x, y } = this._svgPoint(e);
@@ -545,8 +554,25 @@ export class Graph {
             const chart = this._chartArea();
             const ruler = this._rulerDims();
 
-            // Alt + LMB → pan
-            if (e.altKey && e.button === 0) {
+            // Alt + RMB → zoom (horizontal = time, vertical = value, both centered on cursor)
+            if (e.altKey && e.button === 2) {
+                e.preventDefault();
+                this.state.drag = {
+                    type: "zoom",
+                    startX: x, startY: y,
+                    startTimeScale: this.state.timeScale,
+                    startValueScale: this.state.valueScale,
+                    startTimeOffset: this.state.timeOffset,
+                    startValueOffset: this.state.valueOffset,
+                    pivotTime: this.xToTime(x),
+                    pivotValue: this.yToValue(y),
+                };
+                this.svg.style.cursor = "zoom-in";
+                return;
+            }
+
+            // Alt + LMB / Alt + MMB / RMB → pan
+            if ((e.altKey && (e.button === 0 || e.button === 1)) || e.button === 2) {
                 e.preventDefault();
                 this.state.drag = { type: "pan", startX: x, startY: y, startTimeOffset: this.state.timeOffset, startValueOffset: this.state.valueOffset };
                 this.svg.style.cursor = "grabbing";
@@ -558,6 +584,28 @@ export class Graph {
                 this.state.drag = { type: "scrubPlayhead" };
                 this.state.playHead = Math.max(0, this.xToTime(x));
                 this.redraw();
+                return;
+            }
+
+            // Middle mouse → move selected keyframes (Maya-style)
+            if (e.button === 1 && this._inside({ x, y }, chart)) {
+                e.preventDefault();
+                const selKfs = this.state.selection.filter(
+                    (s): s is { kind: "keyframe"; curveIdx: number; kfIdx: number } => s.kind === "keyframe"
+                );
+                if (selKfs.length > 0) {
+                    this.state.drag = {
+                        type: "moveKeyframes",
+                        startX: x, startY: y,
+                        entries: selKfs.map(s => ({
+                            curveIdx: s.curveIdx, kfIdx: s.kfIdx,
+                            kfRef: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx],
+                            origTime: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].time,
+                            origValue: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].value,
+                        })),
+                    };
+                    this.redraw();
+                }
                 return;
             }
 
@@ -663,6 +711,19 @@ export class Graph {
                 return;
             }
 
+            if (drag.type === "zoom") {
+                const SENSITIVITY = 0.007;
+                const tFactor = Math.exp((x - drag.startX) *  SENSITIVITY);
+                const vFactor = Math.exp((y - drag.startY) * -SENSITIVITY); // up = zoom in
+                this.state.timeScale  = Math.max(5,     Math.min(20000, drag.startTimeScale  * tFactor));
+                this.state.valueScale = Math.max(2,     Math.min(10000, drag.startValueScale * vFactor));
+                // Keep the pivot point fixed on screen
+                this.state.timeOffset  = drag.pivotTime  - (drag.startX - this.config.yAxisWidth) / this.state.timeScale;
+                this.state.valueOffset = drag.pivotValue - (this._chartBottom() - drag.startY)    / this.state.valueScale;
+                this.redraw();
+                return;
+            }
+
             if (drag.type === "scrubPlayhead") {
                 this.state.playHead = Math.max(0, this.xToTime(x));
                 this.redraw();
@@ -760,6 +821,19 @@ export class Graph {
                         const value = this._evalCurveAt(ci, t);
                         curve.keyframes.push(mkKf(t, value));
                         curve.keyframes.sort((a, b) => a.time - b.time);
+                    }
+                    this.redraw();
+                    break;
+                }
+                case "d": case "D": {
+                    const { data, selection } = this.state;
+                    const targets = selection.filter((s): s is Extract<SelectionItem, { kind: "keyframe" }> => s.kind === "keyframe");
+                    const kfsToReset = targets.length > 0
+                        ? targets.map(s => data.curves[s.curveIdx].keyframes[s.kfIdx])
+                        : data.curves.flatMap(c => c.keyframes);
+                    for (const kf of kfsToReset) {
+                        kf.inTangent  = { type: "spline", slope: 0 };
+                        kf.outTangent = { type: "spline", slope: 0 };
                     }
                     this.redraw();
                     break;
