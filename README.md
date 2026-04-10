@@ -4,6 +4,44 @@ A Maya-style animation curve editor built with TypeScript and SVG — no canvas,
 
 ![graph-editor screenshot](https://github.com/nudopnu/curvity/blob/main/Screenshot.png?raw=true)
 
+## Installation
+
+Installation with npm:
+
+```bash
+npm i curvity
+```
+
+## Usage
+
+```ts
+import { Graph, SAMPLE_DATA } from 'graphly'
+
+const container = document.querySelector<HTMLElement>('#graph')!
+const editor = new Graph(container)
+
+// Bring your own data
+const editor2 = new Graph(container, undefined, {
+  curves: [
+    {
+      name: 'translateX',
+      color: '#e06060',
+      keyframes: [
+        { time: 0,   value: 0,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
+        { time: 1.0, value: 5,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
+        { time: 2.0, value: 0,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
+      ],
+    },
+  ],
+})
+
+// Public API
+editor.autoFit()          // fit all curves in view
+editor.frameSelection()   // zoom to selected keyframes
+editor.deleteSelected()   // delete selected keyframes
+editor.redraw()           // force a redraw
+```
+
 ## Features
 
 - **Bezier curves** with per-keyframe tangent handles (spline, linear, flat, stepped)
@@ -56,36 +94,6 @@ npm run build
 ```
 
 Output goes to `dist/`.
-
-## Usage as a Module
-
-```ts
-import { Graph, SAMPLE_DATA } from './src/graph'
-
-const container = document.querySelector<HTMLElement>('#graph')!
-const editor = new Graph(container)
-
-// Bring your own data
-const editor2 = new Graph(container, undefined, {
-  curves: [
-    {
-      name: 'translateX',
-      color: '#e06060',
-      keyframes: [
-        { time: 0,   value: 0,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
-        { time: 1.0, value: 5,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
-        { time: 2.0, value: 0,  inTangent: { type: 'spline', slope: 0 }, outTangent: { type: 'spline', slope: 0 } },
-      ],
-    },
-  ],
-})
-
-// Public API
-editor.autoFit()          // fit all curves in view
-editor.frameSelection()   // zoom to selected keyframes
-editor.deleteSelected()   // delete selected keyframes
-editor.redraw()           // force a redraw
-```
 
 ## Tech Stack
 
