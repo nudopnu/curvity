@@ -4,10 +4,8 @@ export type TangentType = "spline" | "linear" | "flat" | "stepped" | "fixed";
 
 export type TangentHandle = {
     type: TangentType;
-    /** Time-space offset from keyframe — only meaningful when type === "fixed" */
-    dx: number;
-    /** Value-space offset from keyframe — only meaningful when type === "fixed" */
-    dy: number;
+    /** dvalue/dtime — only meaningful when type === "fixed" */
+    slope: number;
 };
 
 export type GraphKeyframe = {
@@ -28,7 +26,14 @@ export type GraphData = {
     curves: GraphCurve[];
 };
 
-export type SelectionEntry = { curveIdx: number; kfIdx: number };
+/**
+ * A selection item is either a keyframe or one tangent handle.
+ * - If the keyframe is selected → dragging either tangent handle tilts both (unified).
+ * - If only a tangent handle is selected → only that handle moves.
+ */
+export type SelectionItem =
+    | { kind: "keyframe"; curveIdx: number; kfIdx: number }
+    | { kind: "tangent"; curveIdx: number; kfIdx: number; side: "in" | "out" };
 
 export type GraphDragState =
     | { type: "scrubPlayhead" }
@@ -41,7 +46,7 @@ export type GraphDragState =
           entries: { curveIdx: number; kfIdx: number; origTime: number; origValue: number }[];
           axisLock?: "x" | "y";
       }
-    | { type: "moveTangent"; curveIdx: number; kfIdx: number; side: "in" | "out"; broken: boolean };
+    | { type: "moveTangent"; curveIdx: number; kfIdx: number; side: "in" | "out"; unified: boolean };
 
 export type GraphHoverState =
     | { type: "playhead" }
@@ -69,7 +74,7 @@ export type GraphState = {
     playHead: number;
     drag?: GraphDragState;
     hover?: GraphHoverState;
-    selection: SelectionEntry[];
+    selection: SelectionItem[];
     data: GraphData;
 };
 
@@ -86,8 +91,8 @@ function mkKf(time: number, value: number, type: TangentType = "spline"): GraphK
     return {
         time,
         value,
-        inTangent: { type, dx: 0, dy: 0 },
-        outTangent: { type, dx: 0, dy: 0 },
+        inTangent: { type, slope: 0 },
+        outTangent: { type, slope: 0 },
     };
 }
 
@@ -117,7 +122,9 @@ export const SAMPLE_DATA: GraphData = {
     ],
 };
 
-// ─── Graph class ─────────────────────────────────────────────────────────────
+// ─── Graph class ──────────────────────────────────────────────────────────────
+
+const HANDLE_LEN = 40; // fixed screen-space length for all tangent handles (px)
 
 export class Graph {
     svg: SVGElement;
@@ -172,40 +179,29 @@ export class Graph {
     // ─── Coordinate transforms ────────────────────────────────────────────────
 
     public timeToX(time: number): number {
-        const { yAxisWidth } = this.config;
-        const { timeOffset, timeScale } = this.state;
-        return yAxisWidth + (time - timeOffset) * timeScale;
+        return this.config.yAxisWidth + (time - this.state.timeOffset) * this.state.timeScale;
     }
 
     public xToTime(x: number): number {
-        const { yAxisWidth } = this.config;
-        const { timeOffset, timeScale } = this.state;
-        return (x - yAxisWidth) / timeScale + timeOffset;
+        return (x - this.config.yAxisWidth) / this.state.timeScale + this.state.timeOffset;
     }
 
     public valueToY(value: number): number {
-        const { valueOffset, valueScale } = this.state;
-        const bottom = this._chartBottom();
-        return bottom - (value - valueOffset) * valueScale;
+        return this._chartBottom() - (value - this.state.valueOffset) * this.state.valueScale;
     }
 
     public yToValue(y: number): number {
-        const { valueOffset, valueScale } = this.state;
-        const bottom = this._chartBottom();
-        return (bottom - y) / valueScale + valueOffset;
+        return (this._chartBottom() - y) / this.state.valueScale + this.state.valueOffset;
     }
 
     // ─── Chart geometry ───────────────────────────────────────────────────────
 
     private _chartBottom(): number {
-        const { rulerHeight } = this.config;
-        return this.state.svgHeight - rulerHeight;
+        return this.state.svgHeight - this.config.rulerHeight;
     }
 
     private _chartArea() {
-        const { yAxisWidth } = this.config;
-        const { svgWidth } = this.state;
-        return { left: yAxisWidth, right: svgWidth, top: 0, bottom: this._chartBottom() };
+        return { left: this.config.yAxisWidth, right: this.state.svgWidth, top: 0, bottom: this._chartBottom() };
     }
 
     private _rulerDims() {
@@ -213,31 +209,36 @@ export class Graph {
         const { svgWidth, svgHeight } = this.state;
         const top = svgHeight - rulerHeight;
         const left = showYAxis ? yAxisWidth : 0;
-        return { top, bottom: svgHeight, left, right: svgWidth, height: rulerHeight, width: svgWidth - left };
+        return { top, bottom: svgHeight, left, right: svgWidth, height: rulerHeight };
     }
 
     // ─── Tangent computation ──────────────────────────────────────────────────
 
     /**
-     * Compute the actual control-point offset (in time/value space) for a keyframe's
-     * tangent handle. For auto types (spline, linear, flat) this is derived from
-     * neighboring keyframes. For "fixed" the stored dx/dy is returned directly.
+     * Compute the bezier control-point offset (time/value space) for a keyframe handle.
+     * Auto types derive direction from neighbors; "fixed" uses stored slope + 1/3 segment rule.
+     * This result is used only for drawing the bezier curve path, NOT for the visual handle position.
      */
     private _computeTangent(ci: number, ki: number, side: "in" | "out"): { dx: number; dy: number } {
         const kfs = this.state.data.curves[ci].keyframes;
         const kf = kfs[ki];
         const handle = side === "in" ? kf.inTangent : kf.outTangent;
-
-        if (handle.type === "fixed") return { dx: handle.dx, dy: handle.dy };
-
         const prev = ki > 0 ? kfs[ki - 1] : null;
         const next = ki < kfs.length - 1 ? kfs[ki + 1] : null;
 
+        // For "fixed": use stored slope + 1/3 of neighbor segment for dx.
+        // This is exactly what Maya does for unweighted tangents.
+        if (handle.type === "fixed") {
+            const neighbor = side === "out" ? next : prev;
+            if (!neighbor) return { dx: 0, dy: 0 };
+            const dt = side === "out" ? (neighbor.time - kf.time) / 3 : -(kf.time - neighbor.time) / 3;
+            return { dx: dt, dy: handle.slope * dt };
+        }
+
         if (handle.type === "flat") {
-            const dt =
-                side === "out"
-                    ? next ? (next.time - kf.time) / 3 : 0.3
-                    : prev ? -(kf.time - prev.time) / 3 : -0.3;
+            const dt = side === "out"
+                ? (next ? (next.time - kf.time) / 3 : 0.3)
+                : (prev ? -(kf.time - prev.time) / 3 : -0.3);
             return { dx: dt, dy: 0 };
         }
 
@@ -251,23 +252,52 @@ export class Graph {
 
         // spline / stepped: Catmull-Rom slope
         let slope = 0;
-        if (prev && next) {
-            slope = (next.value - prev.value) / (next.time - prev.time);
-        } else if (next) {
-            slope = (next.value - kf.value) / (next.time - kf.time);
-        } else if (prev) {
-            slope = (kf.value - prev.value) / (kf.time - prev.time);
-        }
+        if (prev && next) slope = (next.value - prev.value) / (next.time - prev.time);
+        else if (next)    slope = (next.value - kf.value)  / (next.time - kf.time);
+        else if (prev)    slope = (kf.value - prev.value)  / (kf.time - prev.time);
 
-        if (side === "out" && next) {
-            const dt = (next.time - kf.time) / 3;
-            return { dx: dt, dy: slope * dt };
-        }
-        if (side === "in" && prev) {
-            const dt = -(kf.time - prev.time) / 3;
-            return { dx: dt, dy: slope * dt };
-        }
+        if (side === "out" && next) { const dt = (next.time - kf.time) / 3;  return { dx: dt, dy: slope * dt }; }
+        if (side === "in"  && prev) { const dt = -(kf.time - prev.time) / 3; return { dx: dt, dy: slope * dt }; }
         return { dx: 0, dy: 0 };
+    }
+
+    /**
+     * Screen-space position of a tangent handle tip.
+     * Always exactly HANDLE_LEN pixels from the keyframe, in the direction of the tangent slope.
+     */
+    private _tangentHandlePos(ci: number, ki: number, side: "in" | "out"): Point {
+        const kf = this.state.data.curves[ci].keyframes[ki];
+        const kx = this.timeToX(kf.time);
+        const ky = this.valueToY(kf.value);
+        const h = this._computeTangent(ci, ki, side);
+        // Convert tangent direction to screen space
+        const sx = h.dx * this.state.timeScale;
+        const sy = -h.dy * this.state.valueScale; // Y axis is inverted
+        const len = Math.hypot(sx, sy);
+        if (len < 1e-6) {
+            // Degenerate: point horizontally in the correct time direction
+            return { x: kx + (side === "out" ? HANDLE_LEN : -HANDLE_LEN), y: ky };
+        }
+        return { x: kx + (sx / len) * HANDLE_LEN, y: ky + (sy / len) * HANDLE_LEN };
+    }
+
+    // ─── Selection helpers ────────────────────────────────────────────────────
+
+    private _isKfSelected(ci: number, ki: number): boolean {
+        return this.state.selection.some(s => s.kind === "keyframe" && s.curveIdx === ci && s.kfIdx === ki);
+    }
+
+    private _isTangentSelected(ci: number, ki: number, side: "in" | "out"): boolean {
+        return this.state.selection.some(
+            s => s.kind === "tangent" && s.curveIdx === ci && s.kfIdx === ki && s.side === side
+        );
+    }
+
+    /** Whether tangent handles should be rendered for this keyframe */
+    private _hasHandleVisible(ci: number, ki: number): boolean {
+        return this._isKfSelected(ci, ki) ||
+            this._isTangentSelected(ci, ki, "in") ||
+            this._isTangentSelected(ci, ki, "out");
     }
 
     // ─── Redraw ───────────────────────────────────────────────────────────────
@@ -287,16 +317,16 @@ export class Graph {
     }
 
     private _addClipPath() {
-        const chart = this._chartArea();
+        const c = this._chartArea();
         const ns = "http://www.w3.org/2000/svg";
         const defs = document.createElementNS(ns, "defs");
         const clip = document.createElementNS(ns, "clipPath");
         clip.setAttribute("id", "chart-clip");
         const rect = document.createElementNS(ns, "rect");
-        rect.setAttribute("x", String(chart.left));
-        rect.setAttribute("y", String(chart.top));
-        rect.setAttribute("width", String(chart.right - chart.left));
-        rect.setAttribute("height", String(chart.bottom - chart.top));
+        rect.setAttribute("x", String(c.left));
+        rect.setAttribute("y", String(c.top));
+        rect.setAttribute("width", String(c.right - c.left));
+        rect.setAttribute("height", String(c.bottom - c.top));
         clip.appendChild(rect);
         defs.appendChild(clip);
         this.svg.appendChild(defs);
@@ -310,12 +340,10 @@ export class Graph {
     private _drawGrid() {
         const chart = this._chartArea();
 
-        // Horizontal lines at nice value steps
-        const topValue = this.yToValue(chart.top);
-        const bottomValue = this.yToValue(chart.bottom);
-        const vStep = this._niceValueStep((topValue - bottomValue) / 8);
-        const vStart = Math.ceil(bottomValue / vStep) * vStep;
-        for (let v = vStart; v <= topValue + 1e-9; v += vStep) {
+        // Horizontal lines at nice value intervals
+        const topVal = this.yToValue(chart.top), botVal = this.yToValue(chart.bottom);
+        const vStep = this._niceValueStep((topVal - botVal) / 8);
+        for (let v = Math.ceil(botVal / vStep) * vStep; v <= topVal + 1e-9; v += vStep) {
             const y = this.valueToY(v);
             const isZero = Math.abs(v) < vStep * 0.01;
             this._el("line", {
@@ -325,16 +353,12 @@ export class Graph {
             });
         }
 
-        // Vertical lines at nice time steps
+        // Vertical lines at nice time intervals
         const tRange = this.xToTime(chart.right) - this.xToTime(chart.left);
         const tStep = this._niceTimeStep(tRange / 8);
-        const tStart = Math.ceil(this.xToTime(chart.left) / tStep) * tStep;
-        for (let t = tStart; t <= this.xToTime(chart.right) + 1e-9; t += tStep) {
+        for (let t = Math.ceil(this.xToTime(chart.left) / tStep) * tStep; t <= this.xToTime(chart.right) + 1e-9; t += tStep) {
             const x = this.timeToX(t);
-            this._el("line", {
-                x1: x, y1: chart.top, x2: x, y2: chart.bottom,
-                stroke: "#1a2535", "stroke-width": 0.5,
-            });
+            this._el("line", { x1: x, y1: chart.top, x2: x, y2: chart.bottom, stroke: "#1a2535", "stroke-width": 0.5 });
         }
     }
 
@@ -343,53 +367,38 @@ export class Graph {
         const chart = this._chartArea();
         this._el("rect", { x: 0, y: chart.top, width: yAxisWidth, height: chart.bottom - chart.top, fill: "#141b26" });
 
-        const topValue = this.yToValue(chart.top);
-        const bottomValue = this.yToValue(chart.bottom);
-        const vStep = this._niceValueStep((topValue - bottomValue) / 8);
-        const vStart = Math.ceil(bottomValue / vStep) * vStep;
-        for (let v = vStart; v <= topValue + 1e-9; v += vStep) {
+        const topVal = this.yToValue(chart.top), botVal = this.yToValue(chart.bottom);
+        const vStep = this._niceValueStep((topVal - botVal) / 8);
+        for (let v = Math.ceil(botVal / vStep) * vStep; v <= topVal + 1e-9; v += vStep) {
             const y = this.valueToY(v);
             if (y < chart.top + 5 || y > chart.bottom - 3) continue;
-            this._el("line", {
-                x1: yAxisWidth - 3, y1: y, x2: yAxisWidth, y2: y,
-                stroke: "#3a4a60", "stroke-width": 1,
-            });
-            const label =
-                Math.abs(v) < vStep * 0.001
-                    ? "0"
-                    : Math.abs(v) >= 10
-                    ? v.toFixed(0)
-                    : v.toPrecision(2).replace(/\.?0+$/, "");
+            this._el("line", { x1: yAxisWidth - 3, y1: y, x2: yAxisWidth, y2: y, stroke: "#3a4a60", "stroke-width": 1 });
+            const label = Math.abs(v) < vStep * 0.001 ? "0"
+                : Math.abs(v) >= 10 ? v.toFixed(0)
+                : v.toPrecision(2).replace(/\.?0+$/, "");
             this._el("text", {
                 x: yAxisWidth - 5, y: y + 3.5,
-                fill: "#4a5a70", "font-size": 9, "text-anchor": "end",
-                "font-family": "system-ui,sans-serif",
+                fill: "#4a5a70", "font-size": 9, "text-anchor": "end", "font-family": "system-ui,sans-serif",
             }, label);
         }
-
-        // Separator
-        this._el("line", {
-            x1: yAxisWidth, y1: chart.top, x2: yAxisWidth, y2: chart.bottom,
-            stroke: "#263040", "stroke-width": 1,
-        });
+        this._el("line", { x1: yAxisWidth, y1: chart.top, x2: yAxisWidth, y2: chart.bottom, stroke: "#263040", "stroke-width": 1 });
     }
 
     private _drawCurves() {
-        const { data, selection } = this.state;
+        const { data } = this.state;
+        const chart = this._chartArea();
 
         for (let ci = 0; ci < data.curves.length; ci++) {
             const curve = data.curves[ci];
             const kfs = curve.keyframes;
             if (kfs.length === 0) continue;
 
-            const curveSelected = selection.some(s => s.curveIdx === ci);
+            const curveSelected = this.state.selection.some(s => s.curveIdx === ci);
 
             if (kfs.length === 1) {
-                // Single keyframe: horizontal line
-                const chart = this._chartArea();
+                const y = this.valueToY(kfs[0].value);
                 this._el("line", {
-                    x1: chart.left, y1: this.valueToY(kfs[0].value),
-                    x2: chart.right, y2: this.valueToY(kfs[0].value),
+                    x1: chart.left, y1: y, x2: chart.right, y2: y,
                     stroke: curve.color, "stroke-width": curveSelected ? 2 : 1.5,
                     opacity: 0.7, "clip-path": "url(#chart-clip)",
                 });
@@ -398,13 +407,10 @@ export class Graph {
 
             let d = "";
             for (let i = 0; i < kfs.length - 1; i++) {
-                const k0 = kfs[i];
-                const k1 = kfs[i + 1];
+                const k0 = kfs[i], k1 = kfs[i + 1];
                 const x0 = this.timeToX(k0.time), y0 = this.valueToY(k0.value);
                 const x3 = this.timeToX(k1.time), y3 = this.valueToY(k1.value);
-
                 if (i === 0) d += `M ${x0} ${y0} `;
-
                 if (k0.outTangent.type === "stepped") {
                     d += `H ${x3} V ${y3} `;
                 } else {
@@ -415,159 +421,113 @@ export class Graph {
                     d += `C ${x1} ${y1} ${x2} ${y2} ${x3} ${y3} `;
                 }
             }
-
-            this._el("path", {
-                d,
-                stroke: curve.color,
-                "stroke-width": curveSelected ? 2 : 1.5,
-                fill: "none",
-                "clip-path": "url(#chart-clip)",
-            });
+            this._el("path", { d, stroke: curve.color, "stroke-width": curveSelected ? 2 : 1.5, fill: "none", "clip-path": "url(#chart-clip)" });
         }
     }
 
     private _drawKeyframes() {
-        const { data, selection } = this.state;
+        const { data } = this.state;
         const chart = this._chartArea();
-        const R = 4.5; // diamond half-size
+        const R = 4.5;
 
         for (let ci = 0; ci < data.curves.length; ci++) {
             const curve = data.curves[ci];
             for (let ki = 0; ki < curve.keyframes.length; ki++) {
                 const kf = curve.keyframes[ki];
-                const x = this.timeToX(kf.time);
-                const y = this.valueToY(kf.value);
-                if (x < chart.left - R || x > chart.right + R) continue;
-                if (y < chart.top - R || y > chart.bottom + R) continue;
+                const x = this.timeToX(kf.time), y = this.valueToY(kf.value);
+                if (x < chart.left - R || x > chart.right + R || y < chart.top - R || y > chart.bottom + R) continue;
 
-                const isSelected = selection.some(s => s.curveIdx === ci && s.kfIdx === ki);
-                const isHovered =
-                    this.state.hover?.type === "keyframe" &&
-                    this.state.hover.curveIdx === ci &&
-                    this.state.hover.kfIdx === ki;
-
+                const isSel = this._isKfSelected(ci, ki);
+                const isHov = this.state.hover?.type === "keyframe" && this.state.hover.curveIdx === ci && this.state.hover.kfIdx === ki;
                 const pts = `${x},${y - R} ${x + R},${y} ${x},${y + R} ${x - R},${y}`;
 
-                if (isSelected) {
-                    this._el("polygon", {
-                        points: pts,
-                        fill: "#ffe060",
-                        stroke: "#fffb",
-                        "stroke-width": 0.75,
-                    });
+                if (isSel) {
+                    this._el("polygon", { points: pts, fill: "#ffe060", stroke: "#fffb", "stroke-width": 0.75 });
                 } else {
-                    this._el("polygon", {
-                        points: pts,
-                        fill: isHovered ? curve.color : "#1c222e",
-                        stroke: curve.color,
-                        "stroke-width": 1.5,
-                    });
+                    this._el("polygon", { points: pts, fill: isHov ? curve.color : "#1c222e", stroke: curve.color, "stroke-width": 1.5 });
                 }
             }
         }
     }
 
     private _drawTangentHandles() {
-        const { data, selection } = this.state;
-        const HR = 3.5; // handle circle radius
+        const { data } = this.state;
+        const HR = 3.5;
 
-        for (const { curveIdx: ci, kfIdx: ki } of selection) {
+        for (let ci = 0; ci < data.curves.length; ci++) {
             const curve = data.curves[ci];
-            const kf = curve.keyframes[ki];
-            const kx = this.timeToX(kf.time);
-            const ky = this.valueToY(kf.value);
+            for (let ki = 0; ki < curve.keyframes.length; ki++) {
+                if (!this._hasHandleVisible(ci, ki)) continue;
 
-            for (const side of ["in", "out"] as const) {
-                if (side === "in" && ki === 0) continue;
-                if (side === "out" && ki === curve.keyframes.length - 1) continue;
-                if (side === "out" && kf.outTangent.type === "stepped") continue;
+                const kf = curve.keyframes[ki];
+                const kx = this.timeToX(kf.time), ky = this.valueToY(kf.value);
 
-                const h = this._computeTangent(ci, ki, side);
-                const hx = this.timeToX(kf.time + h.dx);
-                const hy = this.valueToY(kf.value + h.dy);
+                for (const side of ["in", "out"] as const) {
+                    if (side === "in" && ki === 0) continue;
+                    if (side === "out" && ki === curve.keyframes.length - 1) continue;
+                    if (side === "out" && kf.outTangent.type === "stepped") continue;
 
-                const isHoveredHandle =
-                    this.state.hover?.type === "tangent" &&
-                    this.state.hover.curveIdx === ci &&
-                    this.state.hover.kfIdx === ki &&
-                    this.state.hover.side === side;
+                    const hp = this._tangentHandlePos(ci, ki, side);
+                    const isTangSel = this._isTangentSelected(ci, ki, side);
+                    const isHov =
+                        this.state.hover?.type === "tangent" &&
+                        this.state.hover.curveIdx === ci &&
+                        this.state.hover.kfIdx === ki &&
+                        this.state.hover.side === side;
 
-                this._el("line", {
-                    x1: kx, y1: ky, x2: hx, y2: hy,
-                    stroke: curve.color, "stroke-width": 1, opacity: 0.55,
-                });
-                this._el("circle", {
-                    cx: hx, cy: hy, r: HR,
-                    fill: isHoveredHandle ? "#fff" : curve.color,
-                    stroke: "#fff5", "stroke-width": 0.5,
-                });
+                    this._el("line", { x1: kx, y1: ky, x2: hp.x, y2: hp.y, stroke: curve.color, "stroke-width": 1, opacity: 0.5 });
+                    this._el("circle", {
+                        cx: hp.x, cy: hp.y, r: HR,
+                        fill: isTangSel ? "#ffe060" : isHov ? "#fff" : curve.color,
+                        stroke: "#fff5", "stroke-width": 0.5,
+                    });
+                }
             }
         }
     }
 
     private _drawRuler() {
         const ruler = this._rulerDims();
-        const { top, left, right, width, height } = ruler;
-        this._el("rect", { x: left, y: top, width, height, fill: "#141b26" });
+        const chart = this._chartArea();
+        const { top, left, right, height } = ruler;
+        this._el("rect", { x: left, y: top, width: right - left, height, fill: "#141b26" });
         this._el("line", { x1: left, y1: top, x2: right, y2: top, stroke: "#263040", "stroke-width": 1 });
 
-        const chart = this._chartArea();
         const tRange = this.xToTime(chart.right) - this.xToTime(chart.left);
         const step = this._niceTimeStep(tRange / 8);
-        const tStart = Math.ceil(this.xToTime(chart.left) / step) * step;
-        for (let t = tStart; t <= this.xToTime(right) + 1e-9; t += step) {
+        for (let t = Math.ceil(this.xToTime(chart.left) / step) * step; t <= this.xToTime(right) + 1e-9; t += step) {
             const x = this.timeToX(t);
             if (x < left) continue;
             this._el("line", { x1: x, y1: top, x2: x, y2: top + 4, stroke: "#3a4a60", "stroke-width": 1 });
-            this._el("text", {
-                x: x + 2, y: top + 13,
-                fill: "#4a5a70", "font-size": 9, "font-family": "system-ui,sans-serif",
-            }, this._formatTime(t, step));
+            this._el("text", { x: x + 2, y: top + 13, fill: "#4a5a70", "font-size": 9, "font-family": "system-ui,sans-serif" }, this._formatTime(t, step));
         }
     }
 
     private _drawMarquee() {
         const drag = this.state.drag;
         if (drag?.type !== "marquee") return;
-        const x = Math.min(drag.x0, drag.x1);
-        const y = Math.min(drag.y0, drag.y1);
-        const w = Math.abs(drag.x1 - drag.x0);
-        const h = Math.abs(drag.y1 - drag.y0);
-        this._el("rect", {
-            x, y, width: w, height: h,
-            fill: "rgba(100,150,255,0.06)",
-            stroke: "#6496ff",
-            "stroke-width": 1, "stroke-dasharray": "3 2",
-        });
+        const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+        const w = Math.abs(drag.x1 - drag.x0), h = Math.abs(drag.y1 - drag.y0);
+        this._el("rect", { x, y, width: w, height: h, fill: "rgba(100,150,255,0.06)", stroke: "#6496ff", "stroke-width": 1, "stroke-dasharray": "3 2" });
     }
 
     private _drawPlayhead() {
         const { playHead, svgWidth } = this.state;
-        const { yAxisWidth } = this.config;
         const chart = this._chartArea();
         const ruler = this._rulerDims();
         const x = this.timeToX(playHead);
-        if (x < yAxisWidth || x > svgWidth) return;
-
-        this._el("line", {
-            x1: x, y1: chart.top, x2: x, y2: chart.bottom,
-            stroke: "#50e880", "stroke-width": 1, opacity: 0.45,
-        });
-        this._el("polygon", {
-            points: `${x - 5},${ruler.top} ${x + 5},${ruler.top} ${x},${ruler.top + 7}`,
-            fill: "#50e880", opacity: 0.9,
-        });
+        if (x < this.config.yAxisWidth || x > svgWidth) return;
+        this._el("line", { x1: x, y1: chart.top, x2: x, y2: chart.bottom, stroke: "#50e880", "stroke-width": 1, opacity: 0.45 });
+        this._el("polygon", { points: `${x - 5},${ruler.top} ${x + 5},${ruler.top} ${x},${ruler.top + 7}`, fill: "#50e880", opacity: 0.9 });
     }
 
     // ─── Event setup ──────────────────────────────────────────────────────────
 
     private _setupEvents() {
-        // Scroll wheel: zoom time (default) or value (Alt)
         this.svg.addEventListener("wheel", e => {
             e.preventDefault();
             const { x, y } = this._svgPoint(e);
             const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-
             if (e.altKey) {
                 const vAtCursor = this.yToValue(y);
                 this.state.valueScale = Math.max(2, Math.min(10000, this.state.valueScale * factor));
@@ -585,15 +545,10 @@ export class Graph {
             const chart = this._chartArea();
             const ruler = this._rulerDims();
 
-            // Alt + LMB → pan both axes
+            // Alt + LMB → pan
             if (e.altKey && e.button === 0) {
                 e.preventDefault();
-                this.state.drag = {
-                    type: "pan",
-                    startX: x, startY: y,
-                    startTimeOffset: this.state.timeOffset,
-                    startValueOffset: this.state.valueOffset,
-                };
+                this.state.drag = { type: "pan", startX: x, startY: y, startTimeOffset: this.state.timeOffset, startValueOffset: this.state.valueOffset };
                 this.svg.style.cursor = "grabbing";
                 return;
             }
@@ -606,13 +561,25 @@ export class Graph {
                 return;
             }
 
-            if (!this._inside({ x, y }, chart)) return;
-            if (e.button !== 0) return;
+            if (!this._inside({ x, y }, chart) || e.button !== 0) return;
 
-            // Tangent handle hit (only for selected keyframes)
+            // Tangent handle hit
             const tangentHit = this._hitTangent(x, y);
             if (tangentHit) {
-                this.state.drag = { type: "moveTangent", ...tangentHit, broken: e.altKey };
+                const { curveIdx, kfIdx, side } = tangentHit;
+                // Unified if the keyframe itself is currently selected
+                const unified = this._isKfSelected(curveIdx, kfIdx);
+                if (!e.shiftKey) {
+                    this.state.selection = [{ kind: "tangent", curveIdx, kfIdx, side }];
+                } else {
+                    // Toggle tangent selection
+                    const already = this._isTangentSelected(curveIdx, kfIdx, side);
+                    this.state.selection = already
+                        ? this.state.selection.filter(s => !(s.kind === "tangent" && s.curveIdx === curveIdx && s.kfIdx === kfIdx && s.side === side))
+                        : [...this.state.selection, { kind: "tangent", curveIdx, kfIdx, side }];
+                }
+                this.state.drag = { type: "moveTangent", curveIdx, kfIdx, side, unified };
+                this.redraw();
                 return;
             }
 
@@ -620,38 +587,33 @@ export class Graph {
             const kfHit = this._hitKeyframe(x, y);
             if (kfHit) {
                 const { curveIdx, kfIdx } = kfHit;
-                const alreadySelected = this.state.selection.some(
-                    s => s.curveIdx === curveIdx && s.kfIdx === kfIdx
-                );
+                const alreadySel = this._isKfSelected(curveIdx, kfIdx);
                 if (e.shiftKey) {
-                    if (alreadySelected) {
-                        this.state.selection = this.state.selection.filter(
-                            s => !(s.curveIdx === curveIdx && s.kfIdx === kfIdx)
-                        );
-                    } else {
-                        this.state.selection = [...this.state.selection, { curveIdx, kfIdx }];
-                    }
-                } else if (!alreadySelected) {
-                    this.state.selection = [{ curveIdx, kfIdx }];
+                    this.state.selection = alreadySel
+                        ? this.state.selection.filter(s => !(s.kind === "keyframe" && s.curveIdx === curveIdx && s.kfIdx === kfIdx))
+                        : [...this.state.selection, { kind: "keyframe", curveIdx, kfIdx }];
+                } else if (!alreadySel) {
+                    this.state.selection = [{ kind: "keyframe", curveIdx, kfIdx }];
                 }
-                // Begin move if keyframe is now selected
-                if (this.state.selection.some(s => s.curveIdx === curveIdx && s.kfIdx === kfIdx)) {
+
+                if (this._isKfSelected(curveIdx, kfIdx)) {
                     this.state.drag = {
                         type: "moveKeyframes",
                         startX: x, startY: y,
-                        entries: this.state.selection.map(s => ({
-                            curveIdx: s.curveIdx,
-                            kfIdx: s.kfIdx,
-                            origTime: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].time,
-                            origValue: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].value,
-                        })),
+                        entries: this.state.selection
+                            .filter((s): s is { kind: "keyframe"; curveIdx: number; kfIdx: number } => s.kind === "keyframe")
+                            .map(s => ({
+                                curveIdx: s.curveIdx, kfIdx: s.kfIdx,
+                                origTime: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].time,
+                                origValue: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].value,
+                            })),
                     };
                 }
                 this.redraw();
                 return;
             }
 
-            // Empty area → marquee selection
+            // Empty area → marquee
             if (!e.shiftKey) this.state.selection = [];
             this.state.drag = { type: "marquee", x0: x, y0: y, x1: x, y1: y, additive: e.shiftKey };
             this.redraw();
@@ -664,7 +626,6 @@ export class Graph {
             const ruler = this._rulerDims();
 
             if (!drag) {
-                // Update hover + cursor
                 const tangentHit = this._hitTangent(x, y);
                 const kfHit = !tangentHit ? this._hitKeyframe(x, y) : null;
                 const nearHead = Math.abs(this.timeToX(this.state.playHead) - x) < 6;
@@ -709,20 +670,15 @@ export class Graph {
             }
 
             if (drag.type === "moveKeyframes") {
-                const { startX, startY, entries } = drag;
-                const dx = x - startX;
-                const dy = y - startY;
-
-                // Shift → axis lock (determined once movement exceeds threshold)
-                if (e.shiftKey && !drag.axisLock && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
+                const dx = x - drag.startX, dy = y - drag.startY;
+                if (e.shiftKey && !drag.axisLock && (Math.abs(dx) > 5 || Math.abs(dy) > 5))
                     drag.axisLock = Math.abs(dx) >= Math.abs(dy) ? "x" : "y";
-                }
                 if (!e.shiftKey) drag.axisLock = undefined;
 
                 const dtTime = drag.axisLock === "y" ? 0 : dx / this.state.timeScale;
                 const dtValue = drag.axisLock === "x" ? 0 : -dy / this.state.valueScale;
 
-                for (const { curveIdx, kfIdx, origTime, origValue } of entries) {
+                for (const { curveIdx, kfIdx, origTime, origValue } of drag.entries) {
                     const kf = this.state.data.curves[curveIdx].keyframes[kfIdx];
                     kf.time = origTime + dtTime;
                     kf.value = origValue + dtValue;
@@ -732,35 +688,29 @@ export class Graph {
             }
 
             if (drag.type === "moveTangent") {
-                const { curveIdx, kfIdx, side } = drag;
+                const { curveIdx, kfIdx, side, unified } = drag;
                 const kf = this.state.data.curves[curveIdx].keyframes[kfIdx];
                 const handle = side === "in" ? kf.inTangent : kf.outTangent;
 
-                const newTime = this.xToTime(x);
-                const newValue = this.yToValue(y);
-                let dx = newTime - kf.time;
-                let dy = newValue - kf.value;
+                const kx = this.timeToX(kf.time), ky = this.valueToY(kf.value);
+                const dxScreen = x - kx, dyScreen = y - ky;
 
-                // Clamp to correct half of time axis
-                if (side === "in") dx = Math.min(dx, -0.001);
-                else dx = Math.max(dx, 0.001);
+                // Enforce time direction: out handle must be to the right, in to the left
+                const validDx = side === "out" ? Math.max(dxScreen, 1) : Math.min(dxScreen, -1);
+
+                // slope = dvalue/dtime
+                // dxScreen = dtime * timeScale  →  dtime = dxScreen / timeScale
+                // dyScreen = -dvalue * valueScale  →  dvalue = -dyScreen / valueScale
+                // slope = dvalue/dtime = (-dyScreen/valueScale) / (validDx/timeScale)
+                const newSlope = -(dyScreen * this.state.timeScale) / (validDx * this.state.valueScale);
 
                 handle.type = "fixed";
-                handle.dx = dx;
-                handle.dy = dy;
+                handle.slope = newSlope;
 
-                // Mirror slope to opposite tangent (unified) unless broken (Alt)
-                if (!drag.broken) {
+                if (unified) {
+                    // Tilt both handles together — same slope, stays collinear
                     const opp = side === "in" ? kf.outTangent : kf.inTangent;
-                    if (opp.type !== "stepped") {
-                        const slope = dx !== 0 ? dy / dx : 0;
-                        const existingOpp = this._computeTangent(curveIdx, kfIdx, side === "in" ? "out" : "in");
-                        const oppLen = Math.abs(existingOpp.dx);
-                        const oppSign = side === "in" ? 1 : -1; // out is +time, in is -time
-                        opp.type = "fixed";
-                        opp.dx = oppSign * oppLen;
-                        opp.dy = slope * oppSign * oppLen;
-                    }
+                    if (opp.type !== "stepped") { opp.type = "fixed"; opp.slope = newSlope; }
                 }
                 this.redraw();
                 return;
@@ -769,27 +719,22 @@ export class Graph {
 
         window.addEventListener("mouseup", () => {
             const { drag } = this.state;
-
-            // Sort keyframes after move (fix order if keyframes crossed)
             if (drag?.type === "moveKeyframes") {
+                // Sort keyframes within each affected curve, updating selection indices
                 const affected = new Set(drag.entries.map(e => e.curveIdx));
-                // Build ref→selection map to update indices after sort
-                const refs = new Map<GraphKeyframe, SelectionEntry>();
+                const refs = new Map<GraphKeyframe, SelectionItem>();
                 for (const s of this.state.selection) {
+                    if (s.kind !== "keyframe") continue;
                     refs.set(this.state.data.curves[s.curveIdx].keyframes[s.kfIdx], s);
                 }
-                for (const ci of affected) {
-                    this.state.data.curves[ci].keyframes.sort((a, b) => a.time - b.time);
-                }
-                // Rebuild selection with corrected indices
-                const newSel: SelectionEntry[] = [];
+                for (const ci of affected) this.state.data.curves[ci].keyframes.sort((a, b) => a.time - b.time);
+                const newSel: SelectionItem[] = [];
                 for (const [kfRef, sel] of refs) {
                     const newIdx = this.state.data.curves[sel.curveIdx].keyframes.indexOf(kfRef);
-                    if (newIdx >= 0) newSel.push({ curveIdx: sel.curveIdx, kfIdx: newIdx });
+                    if (newIdx >= 0) newSel.push({ kind: "keyframe", curveIdx: sel.curveIdx, kfIdx: newIdx });
                 }
                 this.state.selection = newSel;
             }
-
             this.state.drag = undefined;
             this.svg.style.cursor = "default";
             this.redraw();
@@ -798,50 +743,45 @@ export class Graph {
         window.addEventListener("keydown", e => {
             const target = e.target as HTMLElement;
             if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
-
             switch (e.key) {
-                case "a": case "A":
-                    this.autoFit(); this.redraw(); break;
-                case "f": case "F":
-                    this.frameSelection(); this.redraw(); break;
-                case "Delete": case "Backspace":
-                    this.deleteSelected(); this.redraw(); break;
+                case "a": case "A": this.autoFit();       this.redraw(); break;
+                case "f": case "F": this.frameSelection(); this.redraw(); break;
+                case "Delete": case "Backspace": this.deleteSelected(); this.redraw(); break;
             }
         });
     }
 
     // ─── Hit testing ─────────────────────────────────────────────────────────
 
-    private _hitKeyframe(x: number, y: number): SelectionEntry | null {
+    private _hitKeyframe(x: number, y: number): { curveIdx: number; kfIdx: number } | null {
         const { data } = this.state;
         const RADIUS = 9;
-        let best: { entry: SelectionEntry; dist: number } | null = null;
+        let best: { curveIdx: number; kfIdx: number; dist: number } | null = null;
         for (let ci = 0; ci < data.curves.length; ci++) {
-            const kfs = data.curves[ci].keyframes;
-            for (let ki = 0; ki < kfs.length; ki++) {
-                const kx = this.timeToX(kfs[ki].time);
-                const ky = this.valueToY(kfs[ki].value);
-                const dist = Math.hypot(kx - x, ky - y);
-                if (dist < RADIUS && (!best || dist < best.dist)) {
-                    best = { entry: { curveIdx: ci, kfIdx: ki }, dist };
-                }
+            for (let ki = 0; ki < data.curves[ci].keyframes.length; ki++) {
+                const kf = data.curves[ci].keyframes[ki];
+                const dist = Math.hypot(this.timeToX(kf.time) - x, this.valueToY(kf.value) - y);
+                if (dist < RADIUS && (!best || dist < best.dist)) best = { curveIdx: ci, kfIdx: ki, dist };
             }
         }
-        return best?.entry ?? null;
+        return best ? { curveIdx: best.curveIdx, kfIdx: best.kfIdx } : null;
     }
 
+    /** Hit test against visible tangent handles only (those with _hasHandleVisible). */
     private _hitTangent(x: number, y: number): { curveIdx: number; kfIdx: number; side: "in" | "out" } | null {
-        const { data, selection } = this.state;
+        const { data } = this.state;
         const RADIUS = 8;
-        for (const { curveIdx: ci, kfIdx: ki } of selection) {
-            const kf = data.curves[ci].keyframes[ki];
-            for (const side of ["in", "out"] as const) {
-                if (side === "in" && ki === 0) continue;
-                if (side === "out" && ki === data.curves[ci].keyframes.length - 1) continue;
-                const h = this._computeTangent(ci, ki, side);
-                const hx = this.timeToX(kf.time + h.dx);
-                const hy = this.valueToY(kf.value + h.dy);
-                if (Math.hypot(hx - x, hy - y) < RADIUS) return { curveIdx: ci, kfIdx: ki, side };
+        for (let ci = 0; ci < data.curves.length; ci++) {
+            for (let ki = 0; ki < data.curves[ci].keyframes.length; ki++) {
+                if (!this._hasHandleVisible(ci, ki)) continue;
+                const kf = data.curves[ci].keyframes[ki];
+                for (const side of ["in", "out"] as const) {
+                    if (side === "in" && ki === 0) continue;
+                    if (side === "out" && ki === data.curves[ci].keyframes.length - 1) continue;
+                    if (side === "out" && kf.outTangent.type === "stepped") continue;
+                    const hp = this._tangentHandlePos(ci, ki, side);
+                    if (Math.hypot(hp.x - x, hp.y - y) < RADIUS) return { curveIdx: ci, kfIdx: ki, side };
+                }
             }
         }
         return null;
@@ -851,23 +791,18 @@ export class Graph {
         const { data } = this.state;
         const x0 = Math.min(drag.x0, drag.x1), x1 = Math.max(drag.x0, drag.x1);
         const y0 = Math.min(drag.y0, drag.y1), y1 = Math.max(drag.y0, drag.y1);
-
-        const newSel: SelectionEntry[] = [];
+        const newSel: SelectionItem[] = [];
         for (let ci = 0; ci < data.curves.length; ci++) {
             for (let ki = 0; ki < data.curves[ci].keyframes.length; ki++) {
                 const kf = data.curves[ci].keyframes[ki];
-                const kx = this.timeToX(kf.time);
-                const ky = this.valueToY(kf.value);
-                if (kx >= x0 && kx <= x1 && ky >= y0 && ky <= y1) {
-                    newSel.push({ curveIdx: ci, kfIdx: ki });
-                }
+                const kx = this.timeToX(kf.time), ky = this.valueToY(kf.value);
+                if (kx >= x0 && kx <= x1 && ky >= y0 && ky <= y1)
+                    newSel.push({ kind: "keyframe", curveIdx: ci, kfIdx: ki });
             }
         }
-
         if (drag.additive) {
-            // Merge, deduplicating
             const existing = this.state.selection.filter(
-                s => !newSel.some(n => n.curveIdx === s.curveIdx && n.kfIdx === s.kfIdx)
+                s => !newSel.some(n => n.kind === s.kind && n.curveIdx === s.curveIdx && n.kfIdx === s.kfIdx)
             );
             this.state.selection = [...existing, ...newSel];
         } else {
@@ -877,65 +812,59 @@ export class Graph {
 
     // ─── Public operations ────────────────────────────────────────────────────
 
-    /** Frame all curves in view (Maya: press A) */
     public autoFit() {
         const { data } = this.state;
         const chart = this._chartArea();
         let minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
-        for (const curve of data.curves) {
+        for (const curve of data.curves)
             for (const kf of curve.keyframes) {
                 minT = Math.min(minT, kf.time); maxT = Math.max(maxT, kf.time);
                 minV = Math.min(minV, kf.value); maxV = Math.max(maxV, kf.value);
             }
-        }
         if (!isFinite(minT)) return;
-        const padT = (maxT - minT) * 0.15 || 0.5;
-        const padV = (maxV - minV) * 0.2 || 2;
-        this.state.timeScale = (chart.right - chart.left) / (maxT - minT + 2 * padT);
-        this.state.timeOffset = minT - padT;
+        const padT = (maxT - minT) * 0.15 || 0.5, padV = (maxV - minV) * 0.2 || 2;
+        this.state.timeScale  = (chart.right - chart.left)  / (maxT - minT + 2 * padT);
+        this.state.timeOffset  = minT - padT;
         this.state.valueScale = (chart.bottom - chart.top) / (maxV - minV + 2 * padV);
         this.state.valueOffset = minV - padV;
     }
 
-    /** Frame selected keyframes in view (Maya: press F) */
     public frameSelection() {
         const { data, selection } = this.state;
         if (selection.length === 0) { this.autoFit(); return; }
         const chart = this._chartArea();
         let minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
-        for (const { curveIdx, kfIdx } of selection) {
-            const kf = data.curves[curveIdx].keyframes[kfIdx];
+        for (const s of selection) {
+            if (s.kind !== "keyframe") continue;
+            const kf = data.curves[s.curveIdx].keyframes[s.kfIdx];
             minT = Math.min(minT, kf.time); maxT = Math.max(maxT, kf.time);
             minV = Math.min(minV, kf.value); maxV = Math.max(maxV, kf.value);
         }
-        const padT = (maxT - minT) * 0.25 || 0.5;
-        const padV = (maxV - minV) * 0.3 || 2;
-        this.state.timeScale = (chart.right - chart.left) / (maxT - minT + 2 * padT);
-        this.state.timeOffset = minT - padT;
+        if (!isFinite(minT)) return;
+        const padT = (maxT - minT) * 0.25 || 0.5, padV = (maxV - minV) * 0.3 || 2;
+        this.state.timeScale  = (chart.right - chart.left)  / (maxT - minT + 2 * padT);
+        this.state.timeOffset  = minT - padT;
         this.state.valueScale = (chart.bottom - chart.top) / (maxV - minV + 2 * padV);
         this.state.valueOffset = minV - padV;
     }
 
-    /** Delete selected keyframes (Maya: Delete key) */
     public deleteSelected() {
-        const { data, selection } = this.state;
+        const { data } = this.state;
         const byCurve = new Map<number, number[]>();
-        for (const { curveIdx, kfIdx } of selection) {
-            if (!byCurve.has(curveIdx)) byCurve.set(curveIdx, []);
-            byCurve.get(curveIdx)!.push(kfIdx);
+        for (const s of this.state.selection) {
+            if (s.kind !== "keyframe") continue;
+            if (!byCurve.has(s.curveIdx)) byCurve.set(s.curveIdx, []);
+            byCurve.get(s.curveIdx)!.push(s.kfIdx);
         }
-        for (const [ci, indices] of byCurve) {
-            for (const ki of indices.sort((a, b) => b - a)) {
+        for (const [ci, indices] of byCurve)
+            for (const ki of indices.sort((a, b) => b - a))
                 data.curves[ci].keyframes.splice(ki, 1);
-            }
-        }
         this.state.selection = [];
     }
 
     public totalDuration(): number {
         let max = 0;
-        for (const c of this.state.data.curves)
-            for (const kf of c.keyframes) max = Math.max(max, kf.time);
+        for (const c of this.state.data.curves) for (const kf of c.keyframes) max = Math.max(max, kf.time);
         return max || 1;
     }
 
@@ -954,10 +883,7 @@ export class Graph {
     }
 
     private _formatTime(t: number, step: number): string {
-        if (step >= 1) return `${t.toFixed(0)}s`;
-        if (step >= 0.1) return `${t.toFixed(1)}s`;
-        if (step >= 0.01) return `${t.toFixed(2)}s`;
-        return `${t.toFixed(3)}s`;
+        return step >= 1 ? `${t.toFixed(0)}s` : step >= 0.1 ? `${t.toFixed(1)}s` : step >= 0.01 ? `${t.toFixed(2)}s` : `${t.toFixed(3)}s`;
     }
 
     private _el(tag: string, attrs: Record<string, string | number>, text?: string): SVGElement {
