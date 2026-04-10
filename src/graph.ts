@@ -145,7 +145,7 @@ export class Graph {
 
     constructor(
         container: HTMLElement | string,
-        config: GraphConfig = DEFAULT_GRAPH_CONFIG,
+        config: Partial<GraphConfig> = {},
         data: GraphData = SAMPLE_DATA
     ) {
         if (typeof container === "string") {
@@ -159,7 +159,7 @@ export class Graph {
             this.svg.setAttribute("tabindex", "0");
         }
 
-        this.config = config;
+        this.config = { ...DEFAULT_GRAPH_CONFIG, ...config };
         this.state = {
             svgWidth: this.svg.clientWidth,
             svgHeight: this.svg.clientHeight,
@@ -798,6 +798,7 @@ export class Graph {
             if (drag.type === "scrubPlayhead") {
                 this.state.playHead = Math.max(0, this.xToTime(x));
                 this.redraw();
+                this._firePlayheadChange();
                 return;
             }
 
@@ -979,11 +980,13 @@ export class Graph {
         const { data } = this.state;
         const chart = this._chartArea();
         let minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
-        for (const curve of data.curves)
-            for (const kf of curve.keyframes) {
+        for (let ci = 0; ci < data.curves.length; ci++) {
+            if (this.state.hiddenCurves.has(ci)) continue;
+            for (const kf of data.curves[ci].keyframes) {
                 minT = Math.min(minT, kf.time); maxT = Math.max(maxT, kf.time);
                 minV = Math.min(minV, kf.value); maxV = Math.max(maxV, kf.value);
             }
+        }
         if (!isFinite(minT)) return;
         const padT = (maxT - minT) * 0.15 || 0.5, padV = (maxV - minV) * 0.2 || 2;
         this.state.timeScale  = (chart.right - chart.left)  / (maxT - minT + 2 * padT);
@@ -1061,6 +1064,59 @@ export class Graph {
         let max = 0;
         for (const c of this.state.data.curves) for (const kf of c.keyframes) max = Math.max(max, kf.time);
         return max || 1;
+    }
+
+    // ─── Playhead API ─────────────────────────────────────────────────────────
+
+    public getPlayhead(): number {
+        return this.state.playHead;
+    }
+
+    public setPlayhead(time: number, redraw = true) {
+        this.state.playHead = Math.max(0, time);
+        if (redraw) this.redraw();
+        this._firePlayheadChange();
+    }
+
+    public stepPlayhead(delta: number, redraw = true) {
+        this.setPlayhead(this.state.playHead + delta, redraw);
+    }
+
+    // ─── Value sampling ───────────────────────────────────────────────────────
+
+    /**
+     * Returns the interpolated value of every curve at the given time.
+     * Hidden curves are included — filter by `hiddenCurves` if needed.
+     * Result is a plain object keyed by curve name.
+     */
+    public getValuesAt(time: number): Record<string, number> {
+        const result: Record<string, number> = {};
+        const { curves } = this.state.data;
+        for (let ci = 0; ci < curves.length; ci++)
+            result[curves[ci].name] = this._evalCurveAt(ci, time);
+        return result;
+    }
+
+    /** Shorthand: getValuesAt(playhead). */
+    public getValuesAtPlayhead(): Record<string, number> {
+        return this.getValuesAt(this.state.playHead);
+    }
+
+    // ─── Playhead-change callback ─────────────────────────────────────────────
+
+    private _onPlayheadChange?: (time: number, values: Record<string, number>) => void;
+
+    /**
+     * Register a callback that fires whenever the playhead moves
+     * (scrubbing, setPlayhead, stepPlayhead).
+     * Pass `null` to unregister.
+     */
+    public onPlayheadChange(cb: ((time: number, values: Record<string, number>) => void) | null) {
+        this._onPlayheadChange = cb ?? undefined;
+    }
+
+    private _firePlayheadChange() {
+        this._onPlayheadChange?.(this.state.playHead, this.getValuesAtPlayhead());
     }
 
     // ─── Utilities ────────────────────────────────────────────────────────────
