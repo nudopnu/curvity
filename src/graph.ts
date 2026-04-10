@@ -43,7 +43,7 @@ export type GraphDragState =
           type: "moveKeyframes";
           startX: number;
           startY: number;
-          entries: { curveIdx: number; kfIdx: number; origTime: number; origValue: number }[];
+          entries: { curveIdx: number; kfIdx: number; kfRef: GraphKeyframe; origTime: number; origValue: number }[];
           axisLock?: "x" | "y";
       }
     | { type: "moveTangent"; curveIdx: number; kfIdx: number; side: "in" | "out"; unified: boolean };
@@ -604,11 +604,19 @@ export class Graph {
                             .filter((s): s is { kind: "keyframe"; curveIdx: number; kfIdx: number } => s.kind === "keyframe")
                             .map(s => ({
                                 curveIdx: s.curveIdx, kfIdx: s.kfIdx,
+                                kfRef: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx],
                                 origTime: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].time,
                                 origValue: this.state.data.curves[s.curveIdx].keyframes[s.kfIdx].value,
                             })),
                     };
                 }
+                this.redraw();
+                return;
+            }
+
+            // Near playhead line → scrub
+            if (Math.abs(this.timeToX(this.state.playHead) - x) < 6) {
+                this.state.drag = { type: "scrubPlayhead" };
                 this.redraw();
                 return;
             }
@@ -678,11 +686,26 @@ export class Graph {
                 const dtTime = drag.axisLock === "y" ? 0 : dx / this.state.timeScale;
                 const dtValue = drag.axisLock === "x" ? 0 : -dy / this.state.valueScale;
 
-                for (const { curveIdx, kfIdx, origTime, origValue } of drag.entries) {
-                    const kf = this.state.data.curves[curveIdx].keyframes[kfIdx];
-                    kf.time = origTime + dtTime;
-                    kf.value = origValue + dtValue;
+                // Move via object references so indices don't matter
+                for (const entry of drag.entries) {
+                    entry.kfRef.time = entry.origTime + dtTime;
+                    entry.kfRef.value = entry.origValue + dtValue;
                 }
+
+                // Sort live — this is what makes keyframes swap during drag, Maya-style
+                const affected = new Set(drag.entries.map(e => e.curveIdx));
+                for (const ci of affected) this.state.data.curves[ci].keyframes.sort((a, b) => a.time - b.time);
+
+                // Update kfIdx in entries to track new positions
+                for (const entry of drag.entries) {
+                    const newIdx = this.state.data.curves[entry.curveIdx].keyframes.indexOf(entry.kfRef);
+                    if (newIdx >= 0) entry.kfIdx = newIdx;
+                }
+
+                // Rebuild keyframe selection items with updated indices
+                const entryKfs: SelectionItem[] = drag.entries.map(e => ({ kind: "keyframe" as const, curveIdx: e.curveIdx, kfIdx: e.kfIdx }));
+                this.state.selection = [...this.state.selection.filter(s => s.kind !== "keyframe"), ...entryKfs];
+
                 this.redraw();
                 return;
             }
@@ -718,23 +741,6 @@ export class Graph {
         });
 
         window.addEventListener("mouseup", () => {
-            const { drag } = this.state;
-            if (drag?.type === "moveKeyframes") {
-                // Sort keyframes within each affected curve, updating selection indices
-                const affected = new Set(drag.entries.map(e => e.curveIdx));
-                const refs = new Map<GraphKeyframe, SelectionItem>();
-                for (const s of this.state.selection) {
-                    if (s.kind !== "keyframe") continue;
-                    refs.set(this.state.data.curves[s.curveIdx].keyframes[s.kfIdx], s);
-                }
-                for (const ci of affected) this.state.data.curves[ci].keyframes.sort((a, b) => a.time - b.time);
-                const newSel: SelectionItem[] = [];
-                for (const [kfRef, sel] of refs) {
-                    const newIdx = this.state.data.curves[sel.curveIdx].keyframes.indexOf(kfRef);
-                    if (newIdx >= 0) newSel.push({ kind: "keyframe", curveIdx: sel.curveIdx, kfIdx: newIdx });
-                }
-                this.state.selection = newSel;
-            }
             this.state.drag = undefined;
             this.svg.style.cursor = "default";
             this.redraw();
@@ -746,6 +752,18 @@ export class Graph {
             switch (e.key) {
                 case "a": case "A": this.autoFit();       this.redraw(); break;
                 case "f": case "F": this.frameSelection(); this.redraw(); break;
+                case "s": case "S": {
+                    const t = this.state.playHead;
+                    for (let ci = 0; ci < this.state.data.curves.length; ci++) {
+                        const curve = this.state.data.curves[ci];
+                        if (curve.keyframes.some(kf => Math.abs(kf.time - t) < 1e-6)) continue;
+                        const value = this._evalCurveAt(ci, t);
+                        curve.keyframes.push(mkKf(t, value));
+                        curve.keyframes.sort((a, b) => a.time - b.time);
+                    }
+                    this.redraw();
+                    break;
+                }
                 case "Delete": case "Backspace": this.deleteSelected(); this.redraw(); break;
             }
         });
@@ -860,6 +878,38 @@ export class Graph {
             for (const ki of indices.sort((a, b) => b - a))
                 data.curves[ci].keyframes.splice(ki, 1);
         this.state.selection = [];
+    }
+
+    /** Evaluate the curve value at a given time using bezier interpolation. */
+    private _evalCurveAt(ci: number, time: number): number {
+        const kfs = this.state.data.curves[ci].keyframes;
+        if (kfs.length === 0) return 0;
+        if (time <= kfs[0].time) return kfs[0].value;
+        if (time >= kfs[kfs.length - 1].time) return kfs[kfs.length - 1].value;
+
+        let seg = 0;
+        for (let i = 0; i < kfs.length - 1; i++) { if (time <= kfs[i + 1].time) { seg = i; break; } }
+
+        const k0 = kfs[seg], k1 = kfs[seg + 1];
+        if (k0.outTangent.type === "stepped") return k0.value;
+
+        const out = this._computeTangent(ci, seg, "out");
+        const inn = this._computeTangent(ci, seg + 1, "in");
+        const t0 = k0.time, v0 = k0.value;
+        const t3 = k1.time, v3 = k1.value;
+        const t1 = t0 + out.dx, v1 = v0 + out.dy;
+        const t2 = t3 + inn.dx, v2 = v3 + inn.dy;
+
+        // Binary-search bezier parameter u so that bezier_time(u) = time
+        let lo = 0, hi = 1;
+        for (let i = 0; i < 32; i++) {
+            const u = (lo + hi) / 2;
+            const m = 1 - u;
+            const bt = m*m*m*t0 + 3*m*m*u*t1 + 3*m*u*u*t2 + u*u*u*t3;
+            if (bt < time) lo = u; else hi = u;
+        }
+        const u = (lo + hi) / 2, m = 1 - u;
+        return m*m*m*v0 + 3*m*m*u*v1 + 3*m*u*u*v2 + u*u*u*v3;
     }
 
     public totalDuration(): number {
