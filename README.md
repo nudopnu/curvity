@@ -15,7 +15,7 @@ npm i curvity
 ## Usage
 
 ```js
-import { Graph } from 'graphly'
+import { Graph } from 'curvity'
 
 const container = document.querySelector('#graph')!
 const editor = new Graph(container)
