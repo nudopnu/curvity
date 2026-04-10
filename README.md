@@ -1,6 +1,6 @@
 # Curvity 
 
-A Maya-style animation curve editor built with TypeScript and SVG — no canvas, no dependencies.
+A Maya-style animation curve editor built with TypeScript and SVG. No external dependencies.
 
 ![graph-editor screenshot](https://github.com/nudopnu/curvity/blob/main/Screenshot.png?raw=true)
 
