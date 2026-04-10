@@ -1,15 +1,48 @@
 {
-  "name": "graph-editor",
+  "name": "curvity",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "./dist/curvity.umd.cjs",
+  "module": "./dist/curvity.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/curvity.js",
+      "require": "./dist/curvity.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "description": "A Maya-style animation curve editor built with TypeScript and SVG",
+  "author": "nudopnu",
+  "license": "MIT",
+  "homepage": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nudopnu/curvity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nudopnu/curvity/issues"
+  },
+  "keywords": [
+    "curve",
+    "editor",
+    "graph",
+    "maya",
+    "maya-style",
+    "keyframe"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@types/node": "^25.6.0",
     "typescript": "~6.0.2",
-    "vite": "^8.0.4"
+    "vite": "^8.0.4",
+    "vite-plugin-dts": "^4.5.4"
   }
 }

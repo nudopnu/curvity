@@ -1,4 +1,4 @@
-# graph-editor
+# Curvity 
 
 A Maya-style animation curve editor built with TypeScript and SVG — no canvas, no dependencies.
 
