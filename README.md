@@ -14,10 +14,10 @@ npm i curvity
 
 ## Usage
 
-```ts
-import { Graph, SAMPLE_DATA } from 'graphly'
+```js
+import { Graph } from 'graphly'
 
-const container = document.querySelector<HTMLElement>('#graph')!
+const container = document.querySelector('#graph')!
 const editor = new Graph(container)
 
 // Bring your own data
