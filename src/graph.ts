@@ -92,6 +92,12 @@ export type GraphState = {
     selection: SelectionItem[];
     hiddenCurves: Set<number>;
     data: GraphData;
+    isPlaying: boolean;
+    isLooping: boolean;
+    /** Left boundary of the range slider track (seconds) */
+    rangeStartSecs: number;
+    /** Right boundary of the range slider track (seconds) */
+    rangeEndSecs: number;
 };
 
 export const DEFAULT_GRAPH_CONFIG: GraphConfig = {
@@ -127,11 +133,11 @@ export const SAMPLE_DATA: GraphData = {
             name: "translateY",
             color: "#60c060",
             keyframes: [
-                mkKf(0, 0, "linear"),
-                mkKf(0.3, 5, "flat"),
-                mkKf(0.6, 0, "linear"),
-                mkKf(0.9, 3, "flat"),
-                mkKf(1.2, 0, "linear"),
+                mkKf(0,    0, "linear"),
+                mkKf(0.25, 5, "flat"),
+                mkKf(0.5,  0, "linear"),
+                mkKf(0.75, 3, "flat"),
+                mkKf(1.0,  0, "linear"),
             ],
         },
         {
@@ -151,19 +157,60 @@ export class Graph {
     config: GraphConfig;
     state: GraphState;
 
+    private _transportEl: HTMLElement | null = null;
+    private _rangeStartInput: HTMLInputElement | null = null;
+    private _rangeEndInput: HTMLInputElement | null = null;
+    private _currentFrameInput: HTMLInputElement | null = null;
+    private _playBtn: HTMLButtonElement | null = null;
+    private _stopBtn: HTMLButtonElement | null = null;
+    private _loopBtn: HTMLButtonElement | null = null;
+    private _rangeFill: HTMLElement | null = null;
+    private _rangeDrag?: {
+        kind: "left" | "right" | "fill";
+        startX: number;
+        startTimeOffset: number;
+        startTimeScale: number;
+        startViewEnd: number;
+        trackWidth: number;
+        totalSecs: number;
+        chartWidth: number;
+    };
+    private _rafId?: number;
+    private _rafLastTime?: number;
+
+    private _playbackTick = (timestamp: number): void => {
+        if (!this.state.isPlaying) return;
+        if (this._rafLastTime === undefined) this._rafLastTime = timestamp;
+        const dt = (timestamp - this._rafLastTime) / 1000;
+        this._rafLastTime = timestamp;
+        const duration = this.totalDuration();
+        let t = this.state.playHead + dt;
+        if (t >= duration) {
+            if (this.state.isLooping) { t = t % duration; }
+            else { t = duration; this.state.isPlaying = false; }
+        }
+        this.setPlayhead(t, true);
+        if (this.state.isPlaying) this._rafId = requestAnimationFrame(this._playbackTick);
+    };
+
     constructor(
         container: HTMLElement | string,
         config: Partial<GraphConfig> = {},
         data: GraphData = SAMPLE_DATA
     ) {
+        let _wrapperForTransport: HTMLElement | undefined;
         if (typeof container === "string") {
             const el = document.querySelector<SVGElement>(`#${container}`);
             if (!el) throw new Error(`Container not found: '${container}'`);
             this.svg = el;
         } else {
+            const wrapper = document.createElement("div");
+            wrapper.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;";
+            container.appendChild(wrapper);
+            _wrapperForTransport = wrapper;
             this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg") as SVGElement;
-            container.appendChild(this.svg);
-            this.svg.style.cssText = "width:100%;height:100%;user-select:none;display:block;outline:none";
+            wrapper.appendChild(this.svg);
+            this.svg.style.cssText = "flex:1;min-height:0;width:100%;user-select:none;display:block;outline:none";
             this.svg.setAttribute("tabindex", "0");
         }
 
@@ -178,9 +225,17 @@ export class Graph {
             playHead: 0,
             selection: [],
             hiddenCurves: new Set(),
+            isPlaying: false,
+            isLooping: false,
+            rangeStartSecs: 0,
+            rangeEndSecs: Math.max(
+                data.curves.reduce((m, c) => Math.max(m, c.keyframes.length ? c.keyframes[c.keyframes.length - 1].time : 0), 0),
+                1
+            ),
             data,
         };
 
+        if (_wrapperForTransport) this._createTransportBar(_wrapperForTransport);
         this._setupEvents();
 
         new ResizeObserver(() => {
@@ -333,6 +388,7 @@ export class Graph {
         this._drawBackground();
         this._drawGrid();
         if (this.config.showYAxis) this._drawYAxis();
+        this._drawRangeOverlay();
         this._drawCurves();
         this._drawKeyframes();
         this._drawTangentHandles();
@@ -340,6 +396,7 @@ export class Graph {
         if (this.state.drag?.type === "marquee") this._drawMarquee();
         this._drawPlayhead();
         if (this.config.showSidebar) this._drawSidebar();
+        this._updateTransportBar();
     }
 
     private _addClipPath() {
@@ -361,6 +418,28 @@ export class Graph {
     private _drawBackground() {
         const { svgWidth, svgHeight } = this.state;
         this._el("rect", { x: 0, y: 0, width: svgWidth, height: svgHeight, fill: "#1c2230" });
+    }
+
+    /** Darkened overlay covering the out-of-range regions (before rangeStart and after rangeEnd). */
+    private _drawRangeOverlay() {
+        const { svgWidth, svgHeight, rangeStartSecs, rangeEndSecs } = this.state;
+        const chartLeft = this._chartLeft();
+        const fill = "rgba(0,0,0,0.32)";
+
+        const xStart = Math.max(this.timeToX(rangeStartSecs), chartLeft);
+        const xEnd   = Math.min(this.timeToX(rangeEndSecs),   svgWidth);
+
+        // Region before range start
+        const leftW = xStart - chartLeft;
+        if (leftW > 0) {
+            this._el("rect", { x: chartLeft, y: 0, width: leftW, height: svgHeight, fill });
+        }
+
+        // Region after range end
+        const rightW = svgWidth - xEnd;
+        if (rightW > 0) {
+            this._el("rect", { x: xEnd, y: 0, width: rightW, height: svgHeight, fill });
+        }
     }
 
     private _drawGrid() {
@@ -795,6 +874,7 @@ export class Graph {
         });
 
         window.addEventListener("mousemove", e => {
+            if (this._rangeDrag) { this._handleRangeDrag(e); return; }
             const { x, y } = this._svgPoint(e);
             const { drag } = this.state;
             const chart = this._chartArea();
@@ -837,7 +917,7 @@ export class Graph {
                 this.state.timeScale  = Math.max(5,     Math.min(20000, drag.startTimeScale  * tFactor));
                 this.state.valueScale = Math.max(2,     Math.min(10000, drag.startValueScale * vFactor));
                 // Keep the pivot point fixed on screen
-                this.state.timeOffset  = drag.pivotTime  - (drag.startX - this.config.yAxisWidth) / this.state.timeScale;
+                this.state.timeOffset  = drag.pivotTime  - (drag.startX - this._chartLeft()) / this.state.timeScale;
                 this.state.valueOffset = drag.pivotValue - (this._chartBottom() - drag.startY)    / this.state.valueScale;
                 this.redraw();
                 return;
@@ -922,6 +1002,8 @@ export class Graph {
         });
 
         window.addEventListener("mouseup", () => {
+            if (this._rangeDrag) document.body.style.cursor = "";
+            this._rangeDrag = undefined;
             this.state.drag = undefined;
             this.svg.style.cursor = "default";
             this.redraw();
@@ -1027,19 +1109,25 @@ export class Graph {
     public autoFit() {
         const { data } = this.state;
         const chart = this._chartArea();
-        let minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
+        // X: fit view to the range bounds (start/end frame) with a small padding — never changes the range itself
+        const rStart = this.state.rangeStartSecs;
+        const rEnd   = this.state.rangeEndSecs;
+        const rSpan  = Math.max(rEnd - rStart, 1 / this.config.fps);
+        const padT   = rSpan * 0.05;
+        this.state.timeScale  = (chart.right - chart.left) / (rSpan + 2 * padT);
+        this.state.timeOffset = rStart - padT;
+        // Y: fit to all visible keyframe values
+        let minV = Infinity, maxV = -Infinity;
         for (let ci = 0; ci < data.curves.length; ci++) {
             if (this.state.hiddenCurves.has(ci)) continue;
             for (const kf of data.curves[ci].keyframes) {
-                minT = Math.min(minT, kf.time); maxT = Math.max(maxT, kf.time);
-                minV = Math.min(minV, kf.value); maxV = Math.max(maxV, kf.value);
+                minV = Math.min(minV, kf.value);
+                maxV = Math.max(maxV, kf.value);
             }
         }
-        if (!isFinite(minT)) return;
-        const padT = (maxT - minT) * 0.15 || 0.5, padV = (maxV - minV) * 0.2 || 2;
-        this.state.timeScale  = (chart.right - chart.left)  / (maxT - minT + 2 * padT);
-        this.state.timeOffset  = minT - padT;
-        this.state.valueScale = (chart.bottom - chart.top) / (maxV - minV + 2 * padV);
+        if (!isFinite(minV)) return;
+        const padV = (maxV - minV) * 0.2 || 2;
+        this.state.valueScale  = (chart.bottom - chart.top) / (maxV - minV + 2 * padV);
         this.state.valueOffset = minV - padV;
     }
 
@@ -1227,6 +1315,287 @@ export class Graph {
             this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: nextIdx }];
             this.setPlayhead(kfs[nextIdx].time);
         }
+    }
+
+    // ─── Transport bar ────────────────────────────────────────────────────────
+
+    private _createTransportBar(wrapper: HTMLElement): void {
+        // Inject spinner-hiding CSS once per document
+        if (!document.getElementById("curvity-style")) {
+            const s = document.createElement("style");
+            s.id = "curvity-style";
+            s.textContent =
+                ".cv-ns::-webkit-inner-spin-button,.cv-ns::-webkit-outer-spin-button{display:none}" +
+                ".cv-ns{-moz-appearance:textfield}";
+            document.head.appendChild(s);
+        }
+
+        const bar = document.createElement("div");
+        bar.style.cssText =
+            "height:54px;flex-shrink:0;background:#0d131c;border-top:1px solid #1a2535;" +
+            "display:flex;flex-direction:column;justify-content:center;gap:4px;" +
+            "padding:0 8px;box-sizing:border-box;";
+        this._transportEl = bar;
+        wrapper.appendChild(bar);
+
+        const inputCss =
+            "width:46px;background:#141b26;color:#7080a0;border:1px solid #1e2d40;border-radius:3px;" +
+            "font-size:10px;font-family:system-ui,sans-serif;text-align:center;padding:2px 0;outline:none;";
+
+        // ── Range row ─────────────────────────────────────────────────────
+        const rangeRow = document.createElement("div");
+        rangeRow.style.cssText = "display:flex;align-items:center;gap:5px;height:16px;";
+        bar.appendChild(rangeRow);
+
+        this._rangeStartInput = document.createElement("input");
+        this._rangeStartInput.type = "number";
+        this._rangeStartInput.className = "cv-ns";
+        this._rangeStartInput.style.cssText = inputCss;
+        this._rangeStartInput.value = "0";
+        rangeRow.appendChild(this._rangeStartInput);
+
+        const track = document.createElement("div");
+        track.style.cssText =
+            "flex:1;height:14px;background:#141b26;border:1px solid #1a2535;border-radius:3px;" +
+            "position:relative;overflow:hidden;box-sizing:border-box;";
+        rangeRow.appendChild(track);
+
+        const fill = document.createElement("div");
+        fill.style.cssText =
+            "position:absolute;top:1px;bottom:1px;left:0;width:60px;" +
+            "background:#253545;border-radius:2px;cursor:grab;" +
+            "display:flex;align-items:stretch;";
+        this._rangeFill = fill;
+        track.appendChild(fill);
+
+        const leftHandle = document.createElement("div");
+        leftHandle.style.cssText =
+            "width:5px;flex-shrink:0;background:#3a5a7a;cursor:ew-resize;border-radius:2px 0 0 2px;";
+        fill.appendChild(leftHandle);
+
+        const centerFill = document.createElement("div");
+        centerFill.style.cssText = "flex:1;";
+        fill.appendChild(centerFill);
+
+        const rightHandle = document.createElement("div");
+        rightHandle.style.cssText =
+            "width:5px;flex-shrink:0;background:#3a5a7a;cursor:ew-resize;border-radius:0 2px 2px 0;";
+        fill.appendChild(rightHandle);
+
+        this._rangeEndInput = document.createElement("input");
+        this._rangeEndInput.type = "number";
+        this._rangeEndInput.className = "cv-ns";
+        this._rangeEndInput.style.cssText = inputCss;
+        this._rangeEndInput.value = "100";
+        rangeRow.appendChild(this._rangeEndInput);
+
+        // ── Playback row ──────────────────────────────────────────────────
+        const playRow = document.createElement("div");
+        playRow.style.cssText = "display:flex;align-items:center;gap:5px;height:22px;";
+        bar.appendChild(playRow);
+
+        const mkBtn = (label: string, title: string): HTMLButtonElement => {
+            const b = document.createElement("button");
+            b.style.cssText =
+                "width:24px;height:20px;background:#141b26;color:#7080a0;border:1px solid #1e2d40;" +
+                "border-radius:3px;font-size:11px;cursor:pointer;padding:0;" +
+                "font-family:system-ui,sans-serif;display:inline-flex;" +
+                "align-items:center;justify-content:center;";
+            b.textContent = label;
+            b.title = title;
+            return b;
+        };
+
+        this._playBtn = mkBtn("▶", "Play / Pause");
+        playRow.appendChild(this._playBtn);
+
+        this._stopBtn = mkBtn("■", "Stop — return to frame 0");
+        playRow.appendChild(this._stopBtn);
+
+        this._loopBtn = mkBtn("⟳", "Loop");
+        playRow.appendChild(this._loopBtn);
+
+        const spacer = document.createElement("div");
+        spacer.style.cssText = "flex:1;";
+        playRow.appendChild(spacer);
+
+        const frameLabel = document.createElement("span");
+        frameLabel.style.cssText =
+            "color:#4a5a70;font-size:10px;font-family:system-ui,sans-serif;margin-right:2px;";
+        frameLabel.textContent = "Frame";
+        playRow.appendChild(frameLabel);
+
+        this._currentFrameInput = document.createElement("input");
+        this._currentFrameInput.type = "number";
+        this._currentFrameInput.className = "cv-ns";
+        this._currentFrameInput.style.cssText = inputCss + "width:52px;";
+        this._currentFrameInput.value = "0";
+        playRow.appendChild(this._currentFrameInput);
+
+        this._setupTransportEvents(track, fill, leftHandle, rightHandle);
+    }
+
+    private _setupTransportEvents(
+        track: HTMLElement,
+        fill: HTMLElement,
+        leftHandle: HTMLElement,
+        rightHandle: HTMLElement,
+    ): void {
+        const startRangeDrag = (kind: "left" | "right" | "fill", clientX: number) => {
+            const chartW = Math.max(this.state.svgWidth - this._chartLeft(), 1);
+            document.body.style.cursor = kind === "fill" ? "grabbing" : "ew-resize";
+            this._rangeDrag = {
+                kind,
+                startX: clientX,
+                startTimeOffset: this.state.timeOffset,
+                startTimeScale:  this.state.timeScale,
+                startViewEnd:    this.state.timeOffset + chartW / this.state.timeScale,
+                trackWidth:      track.clientWidth,
+                totalSecs:       this._totalRangeSeconds(),
+                chartWidth:      chartW,
+            };
+        };
+
+        leftHandle.addEventListener("mousedown",  e => { e.preventDefault(); e.stopPropagation(); startRangeDrag("left",  e.clientX); });
+        rightHandle.addEventListener("mousedown", e => { e.preventDefault(); e.stopPropagation(); startRangeDrag("right", e.clientX); });
+        fill.addEventListener("mousedown", e => {
+            if (e.target === leftHandle || e.target === rightHandle) return;
+            e.preventDefault(); e.stopPropagation();
+            startRangeDrag("fill", e.clientX);
+        });
+
+        this._rangeStartInput!.addEventListener("change", () => {
+            const f = parseInt(this._rangeStartInput!.value, 10);
+            if (isNaN(f)) return;
+            const fps = this.config.fps;
+            const newStart = f / fps;
+            // Clamp so start < end
+            const newClamped = Math.min(newStart, this.state.rangeEndSecs - 1 / fps);
+            this.state.rangeStartSecs = newClamped;
+            // Push view right if it starts before the new range start (preserve zoom)
+            if (this.state.timeOffset < newClamped) {
+                this.state.timeOffset = newClamped;
+            }
+            this.redraw();
+        });
+
+        this._rangeEndInput!.addEventListener("change", () => {
+            const f = parseInt(this._rangeEndInput!.value, 10);
+            if (isNaN(f)) return;
+            const fps = this.config.fps;
+            const newEnd = f / fps;
+            // Clamp so end > start
+            const newClamped = Math.max(newEnd, this.state.rangeStartSecs + 1 / fps);
+            this.state.rangeEndSecs = newClamped;
+            // Push view left if view end exceeds new range end (preserve zoom = same timeScale)
+            const chartW   = Math.max(this.state.svgWidth - this._chartLeft(), 1);
+            const viewW    = chartW / this.state.timeScale;
+            if (this.state.timeOffset + viewW > newClamped) {
+                this.state.timeOffset = Math.max(this.state.rangeStartSecs, newClamped - viewW);
+            }
+            this.redraw();
+        });
+
+        this._currentFrameInput!.addEventListener("change", () => {
+            const f = parseInt(this._currentFrameInput!.value, 10);
+            if (isNaN(f)) return;
+            this.setPlayhead(f / this.config.fps);
+        });
+
+        this._playBtn!.addEventListener("click", () => {
+            if (this.state.isPlaying) this._pausePlayback();
+            else this._startPlayback();
+        });
+
+        this._stopBtn!.addEventListener("click", () => {
+            this._pausePlayback();
+            this.setPlayhead(0);
+        });
+
+        this._loopBtn!.addEventListener("click", () => {
+            this.state.isLooping = !this.state.isLooping;
+            this._updateTransportBar();
+        });
+    }
+
+    private _handleRangeDrag(e: MouseEvent): void {
+        const drag = this._rangeDrag!;
+        const dx = e.clientX - drag.startX;
+        const dt = drag.trackWidth > 0 ? (dx / drag.trackWidth) * drag.totalSecs : 0;
+        const minViewSecs = 2 / this.config.fps;
+        const rangeStart = this.state.rangeStartSecs;
+        const rangeEnd   = this.state.rangeEndSecs;
+
+        if (drag.kind === "fill") {
+            const viewW = drag.chartWidth / drag.startTimeScale;
+            const newTimeOffset = Math.max(rangeStart, Math.min(rangeEnd - viewW, drag.startTimeOffset + dt));
+            this.state.timeOffset = newTimeOffset;
+            this.state.timeScale  = drag.startTimeScale;
+        } else if (drag.kind === "left") {
+            const rawLeft    = drag.startTimeOffset + dt;
+            const clampedLeft = Math.max(rangeStart, Math.min(drag.startViewEnd - minViewSecs, rawLeft));
+            const newViewW   = drag.startViewEnd - clampedLeft;
+            this.state.timeOffset = clampedLeft;
+            this.state.timeScale  = drag.chartWidth / newViewW;
+        } else {
+            const rawRight   = drag.startViewEnd + dt;
+            const clampedRight = Math.min(rangeEnd, Math.max(drag.startTimeOffset + minViewSecs, rawRight));
+            const newViewW   = clampedRight - drag.startTimeOffset;
+            this.state.timeOffset = drag.startTimeOffset;
+            this.state.timeScale  = drag.chartWidth / newViewW;
+        }
+        this.redraw();
+    }
+
+    private _totalRangeSeconds(): number {
+        return Math.max(this.state.rangeEndSecs - this.state.rangeStartSecs, 1 / this.config.fps);
+    }
+
+    private _updateTransportBar(): void {
+        if (!this._transportEl) return;
+        const fps        = this.config.fps;
+        const chartW     = Math.max(this.state.svgWidth - this._chartLeft(), 1);
+        const viewStart  = this.state.timeOffset;
+        const viewEnd    = viewStart + chartW / this.state.timeScale;
+        const rangeStart = this.state.rangeStartSecs;
+        const rangeEnd   = this.state.rangeEndSecs;
+
+        // Inputs reflect the range boundaries (not the current view)
+        if (document.activeElement !== this._rangeStartInput)
+            this._rangeStartInput!.value = String(Math.round(rangeStart * fps));
+        if (document.activeElement !== this._rangeEndInput)
+            this._rangeEndInput!.value   = String(Math.round(rangeEnd   * fps));
+        if (document.activeElement !== this._currentFrameInput)
+            this._currentFrameInput!.value = String(Math.round(this.state.playHead * fps));
+
+        this._playBtn!.textContent = this.state.isPlaying ? "⏸" : "▶";
+        this._loopBtn!.style.color = this.state.isLooping  ? "#50e880" : "#7080a0";
+
+        const track = this._rangeFill!.parentElement;
+        if (track) {
+            const trackW    = track.clientWidth;
+            const rangeW    = Math.max(rangeEnd - rangeStart, 1 / fps);
+            const fillL     = Math.max(0, ((viewStart - rangeStart) / rangeW) * trackW);
+            const rawFillW  = ((viewEnd - viewStart) / rangeW) * trackW;
+            const fillW     = Math.min(trackW - fillL, Math.max(rawFillW, 10));
+            this._rangeFill!.style.left  = `${fillL}px`;
+            this._rangeFill!.style.width = `${fillW}px`;
+        }
+    }
+
+    private _startPlayback(): void {
+        if (this.totalDuration() <= 0) return;
+        this.state.isPlaying = true;
+        this._rafLastTime = undefined;
+        this._rafId = requestAnimationFrame(this._playbackTick);
+        this._updateTransportBar();
+    }
+
+    private _pausePlayback(): void {
+        this.state.isPlaying = false;
+        if (this._rafId !== undefined) { cancelAnimationFrame(this._rafId); this._rafId = undefined; }
+        this._rafLastTime = undefined;
+        this._updateTransportBar();
     }
 
     // ─── Utilities ────────────────────────────────────────────────────────────
