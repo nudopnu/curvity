@@ -67,6 +67,12 @@ export type GraphConfig = {
     rulerHeight: number;
     showSidebar: boolean;
     sidebarWidth: number;
+    /** Frames per second — used for x-axis labels and frame snapping. Default 24. */
+    fps: number;
+    /** Snap keyframe times to the nearest frame boundary when dragging or inserting. Default true. */
+    snapToFrames: boolean;
+    /** If set, snap keyframe values to multiples of this number when dragging. */
+    snapValueStep?: number;
 };
 
 export type GraphState = {
@@ -94,7 +100,9 @@ export const DEFAULT_GRAPH_CONFIG: GraphConfig = {
     yAxisWidth: 44,
     rulerHeight: 20,
     showSidebar: true,
-    sidebarWidth: 140,
+    sidebarWidth: 164,
+    fps: 24,
+    snapToFrames: true,
 };
 
 // ─── Sample data ──────────────────────────────────────────────────────────────
@@ -409,6 +417,12 @@ export class Graph {
         const { svgHeight } = this.state;
         const ROW_H = 24, START_Y = 30;
 
+        // Button x positions (relative to sidebarWidth)
+        const eyeX  = sidebarWidth - 10;
+        const nextX = sidebarWidth - 24;
+        const addX  = sidebarWidth - 40;
+        const prevX = sidebarWidth - 56;
+
         this._el("rect", { x: 0, y: 0, width: sidebarWidth, height: svgHeight, fill: "#111720" });
         this._el("line", { x1: sidebarWidth, y1: 0, x2: sidebarWidth, y2: svgHeight, stroke: "#1e2d40", "stroke-width": 1 });
 
@@ -420,6 +434,7 @@ export class Graph {
             const visible = !this.state.hiddenCurves.has(ci);
             const isKfSel = this.state.selection.some(s => s.curveIdx === ci);
             const ry = START_Y + ci * ROW_H;
+            const btnY = ry + 12;
 
             // Row highlight if curve has selection
             if (isKfSel)
@@ -435,14 +450,39 @@ export class Graph {
                 "font-size": 11, "font-family": "system-ui,sans-serif",
             }, curve.name);
 
+            // ◄ Prev keyframe button
+            const hasPrev = curve.keyframes.some(kf => kf.time < this.state.playHead - 1e-9);
+            const prevColor = hasPrev ? "#5a7090" : "#2a3a4a";
+            this._el("polygon", {
+                points: `${prevX - 4},${btnY} ${prevX + 3},${btnY - 3.5} ${prevX + 3},${btnY + 3.5}`,
+                fill: prevColor,
+            });
+
+            // ◆ Add/remove keyframe button
+            const hasKfHere = this._hasKfAtPlayhead(ci);
+            this._el("polygon", {
+                points: `${addX},${btnY - 4.5} ${addX + 4.5},${btnY} ${addX},${btnY + 4.5} ${addX - 4.5},${btnY}`,
+                fill: hasKfHere ? curve.color : "none",
+                stroke: hasKfHere ? curve.color : "#5a7090",
+                "stroke-width": 1,
+            });
+
+            // ► Next keyframe button
+            const hasNext = curve.keyframes.some(kf => kf.time > this.state.playHead + 1e-9);
+            const nextColor = hasNext ? "#5a7090" : "#2a3a4a";
+            this._el("polygon", {
+                points: `${nextX + 4},${btnY} ${nextX - 3},${btnY - 3.5} ${nextX - 3},${btnY + 3.5}`,
+                fill: nextColor,
+            });
+
             // Eye icon
-            const ex = sidebarWidth - 14, ey = ry + 12;
+            const ey = btnY;
             if (visible) {
-                this._el("ellipse", { cx: ex, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#4a5a70", "stroke-width": 1.2 });
-                this._el("circle", { cx: ex, cy: ey, r: 1.8, fill: "#4a5a70" });
+                this._el("ellipse", { cx: eyeX, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#4a5a70", "stroke-width": 1.2 });
+                this._el("circle", { cx: eyeX, cy: ey, r: 1.8, fill: "#4a5a70" });
             } else {
-                this._el("ellipse", { cx: ex, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#2a3a4a", "stroke-width": 1.2 });
-                this._el("line", { x1: ex - 6, y1: ey - 4, x2: ex + 6, y2: ey + 4, stroke: "#2a3a4a", "stroke-width": 1.5 });
+                this._el("ellipse", { cx: eyeX, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#2a3a4a", "stroke-width": 1.2 });
+                this._el("line", { x1: eyeX - 6, y1: ey - 4, x2: eyeX + 6, y2: ey + 4, stroke: "#2a3a4a", "stroke-width": 1.5 });
             }
         }
     }
@@ -565,7 +605,7 @@ export class Graph {
             const x = this.timeToX(t);
             if (x < left) continue;
             this._el("line", { x1: x, y1: top, x2: x, y2: top + 4, stroke: "#3a4a60", "stroke-width": 1 });
-            this._el("text", { x: x + 2, y: top + 13, fill: "#4a5a70", "font-size": 9, "font-family": "system-ui,sans-serif" }, this._formatTime(t, step));
+            this._el("text", { x: x + 2, y: top + 13, fill: "#4a5a70", "font-size": 9, "font-family": "system-ui,sans-serif" }, this._formatTime(t));
         }
     }
 
@@ -603,7 +643,7 @@ export class Graph {
             } else {
                 const tAtCursor = this.xToTime(x);
                 this.state.timeScale = Math.max(5, Math.min(20000, this.state.timeScale * factor));
-                this.state.timeOffset = tAtCursor - (x - this.config.yAxisWidth) / this.state.timeScale;
+                this.state.timeOffset = tAtCursor - (x - this._chartLeft()) / this.state.timeScale;
             }
             this.redraw();
         }, { passive: false });
@@ -638,13 +678,21 @@ export class Graph {
                 return;
             }
 
-            // Sidebar click → toggle curve visibility
+            // Sidebar click → keyframe navigation or toggle visibility
             if (this.config.showSidebar && x >= 0 && x <= this.config.sidebarWidth && e.button === 0) {
                 const ROW_H = 24, START_Y = 30;
                 const ci = Math.floor((y - START_Y) / ROW_H);
                 if (ci >= 0 && ci < this.state.data.curves.length) {
-                    if (this.state.hiddenCurves.has(ci)) this.state.hiddenCurves.delete(ci);
-                    else this.state.hiddenCurves.add(ci);
+                    const sbW = this.config.sidebarWidth;
+                    const nextX = sbW - 24, addX = sbW - 40, prevX = sbW - 56;
+                    const btnR = 8;
+                    if (Math.abs(x - prevX) < btnR)      { this._gotoPrevKeyframe(ci); }
+                    else if (Math.abs(x - addX) < btnR)  { this._toggleKeyframeAtPlayhead(ci); }
+                    else if (Math.abs(x - nextX) < btnR) { this._gotoNextKeyframe(ci); }
+                    else {
+                        if (this.state.hiddenCurves.has(ci)) this.state.hiddenCurves.delete(ci);
+                        else this.state.hiddenCurves.add(ci);
+                    }
                     this.redraw();
                 }
                 return;
@@ -653,7 +701,7 @@ export class Graph {
             // Ruler → scrub playhead
             if (this._inside({ x, y }, ruler)) {
                 this.state.drag = { type: "scrubPlayhead" };
-                this.state.playHead = Math.max(0, this.xToTime(x));
+                this.state.playHead = this._snapTime(Math.max(0, this.xToTime(x)));
                 this.redraw();
                 return;
             }
@@ -796,7 +844,7 @@ export class Graph {
             }
 
             if (drag.type === "scrubPlayhead") {
-                this.state.playHead = Math.max(0, this.xToTime(x));
+                this.state.playHead = this._snapTime(Math.max(0, this.xToTime(x)));
                 this.redraw();
                 this._firePlayheadChange();
                 return;
@@ -821,8 +869,8 @@ export class Graph {
 
                 // Move via object references so indices don't matter
                 for (const entry of drag.entries) {
-                    entry.kfRef.time = entry.origTime + dtTime;
-                    entry.kfRef.value = entry.origValue + dtValue;
+                    entry.kfRef.time = this._snapTime(entry.origTime + dtTime);
+                    entry.kfRef.value = this._snapValue(entry.origValue + dtValue);
                 }
 
                 // Sort live — this is what makes keyframes swap during drag, Maya-style
@@ -886,7 +934,7 @@ export class Graph {
                 case "a": case "A": this.autoFit();       this.redraw(); break;
                 case "f": case "F": this.frameSelection(); this.redraw(); break;
                 case "s": case "S": {
-                    const t = this.state.playHead;
+                    const t = this._snapTime(this.state.playHead);
                     for (let ci = 0; ci < this.state.data.curves.length; ci++) {
                         const curve = this.state.data.curves[ci];
                         if (curve.keyframes.some(kf => Math.abs(kf.time - t) < 1e-6)) continue;
@@ -1119,11 +1167,78 @@ export class Graph {
         this._onPlayheadChange?.(this.state.playHead, this.getValuesAtPlayhead());
     }
 
+    // ─── Snapping ─────────────────────────────────────────────────────────────
+
+    private _snapTime(time: number): number {
+        if (!this.config.snapToFrames) return time;
+        return Math.round(time * this.config.fps) / this.config.fps;
+    }
+
+    private _snapValue(value: number): number {
+        const s = this.config.snapValueStep;
+        return s ? Math.round(value / s) * s : value;
+    }
+
+    // ─── Sidebar keyframe helpers ─────────────────────────────────────────────
+
+    private _hasKfAtPlayhead(ci: number): boolean {
+        const t = this.state.playHead;
+        const tolerance = 0.5 / this.config.fps;
+        return this.state.data.curves[ci].keyframes.some(kf => Math.abs(kf.time - t) <= tolerance);
+    }
+
+    private _toggleKeyframeAtPlayhead(ci: number): void {
+        const t = this._snapTime(this.state.playHead);
+        const tolerance = 0.5 / this.config.fps;
+        const curve = this.state.data.curves[ci];
+        const idx = curve.keyframes.findIndex(kf => Math.abs(kf.time - t) <= tolerance);
+        if (idx >= 0) {
+            curve.keyframes.splice(idx, 1);
+            this.state.selection = this.state.selection.filter(
+                s => !(s.curveIdx === ci && s.kfIdx === idx)
+            );
+        } else {
+            curve.keyframes.push(mkKf(t, this._evalCurveAt(ci, t)));
+            curve.keyframes.sort((a, b) => a.time - b.time);
+            const newIdx = curve.keyframes.findIndex(kf => Math.abs(kf.time - t) < 1e-9);
+            if (newIdx >= 0)
+                this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: newIdx }];
+        }
+    }
+
+    private _gotoPrevKeyframe(ci: number): void {
+        const t = this.state.playHead;
+        const kfs = this.state.data.curves[ci].keyframes;
+        let bestIdx = -1;
+        for (let i = kfs.length - 1; i >= 0; i--) {
+            if (kfs[i].time < t - 1e-9) { bestIdx = i; break; }
+        }
+        if (bestIdx >= 0) {
+            this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: bestIdx }];
+            this.setPlayhead(kfs[bestIdx].time);
+        }
+    }
+
+    private _gotoNextKeyframe(ci: number): void {
+        const t = this.state.playHead;
+        const kfs = this.state.data.curves[ci].keyframes;
+        const nextIdx = kfs.findIndex(kf => kf.time > t + 1e-9);
+        if (nextIdx >= 0) {
+            this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: nextIdx }];
+            this.setPlayhead(kfs[nextIdx].time);
+        }
+    }
+
     // ─── Utilities ────────────────────────────────────────────────────────────
 
     private _niceTimeStep(approx: number): number {
-        const steps = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50];
-        return steps.find(v => v >= approx) ?? 50;
+        const fps = this.config.fps;
+        // Work in frame units so grid lines always land on integer frames
+        const approxFrames = Math.max(approx * fps, 0.5);
+        const mag = Math.pow(10, Math.floor(Math.log10(approxFrames)));
+        const norm = approxFrames / mag;
+        const niceFrames = (norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10) * mag;
+        return niceFrames / fps;
     }
 
     private _niceValueStep(approx: number): number {
@@ -1133,8 +1248,8 @@ export class Graph {
         return (norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10) * mag;
     }
 
-    private _formatTime(t: number, step: number): string {
-        return step >= 1 ? `${t.toFixed(0)}s` : step >= 0.1 ? `${t.toFixed(1)}s` : step >= 0.01 ? `${t.toFixed(2)}s` : `${t.toFixed(3)}s`;
+    private _formatTime(t: number): string {
+        return String(Math.round(t * this.config.fps));
     }
 
     private _el(tag: string, attrs: Record<string, string | number>, text?: string): SVGElement {
