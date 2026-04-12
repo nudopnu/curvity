@@ -2,7 +2,7 @@
 
 A Maya-style animation curve editor built with TypeScript and SVG without any external dependencies.
 
-**Warning** This is a very early Release. Expect severe bugs and breaking changes up to version `0.1.x`!
+**Warning** This is a very early release. Expect severe bugs and breaking changes up to version `0.1.x`!
 
 ![graph-editor screenshot](https://github.com/nudopnu/curvity/blob/main/Screenshot.png?raw=true)
 
