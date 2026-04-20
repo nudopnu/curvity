@@ -165,6 +165,8 @@ export class Graph {
     private _stopBtn: HTMLButtonElement | null = null;
     private _loopBtn: HTMLButtonElement | null = null;
     private _rangeFill: HTMLElement | null = null;
+    private _svgWrapper: HTMLElement | null = null;
+    private _curveValueInputs: HTMLInputElement[] = [];
     private _rangeDrag?: {
         kind: "left" | "right" | "fill";
         startX: number;
@@ -205,9 +207,10 @@ export class Graph {
             this.svg = el;
         } else {
             const wrapper = document.createElement("div");
-            wrapper.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;";
+            wrapper.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;position:relative;";
             container.appendChild(wrapper);
             _wrapperForTransport = wrapper;
+            this._svgWrapper = wrapper;
             this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg") as SVGElement;
             wrapper.appendChild(this.svg);
             this.svg.style.cssText = "flex:1;min-height:0;width:100%;user-select:none;display:block;outline:none";
@@ -396,6 +399,7 @@ export class Graph {
         if (this.state.drag?.type === "marquee") this._drawMarquee();
         this._drawPlayhead();
         if (this.config.showSidebar) this._drawSidebar();
+        this._syncSidebarInputs();
         this._updateTransportBar();
     }
 
@@ -494,7 +498,7 @@ export class Graph {
     private _drawSidebar() {
         const { sidebarWidth, data } = { ...this.config, data: this.state.data };
         const { svgHeight } = this.state;
-        const ROW_H = 24, START_Y = 30;
+        const ROW_H = 40, START_Y = 30;
 
         // Button x positions (relative to sidebarWidth)
         const eyeX  = sidebarWidth - 10;
@@ -563,6 +567,9 @@ export class Graph {
                 this._el("ellipse", { cx: eyeX, cy: ey, rx: 5, ry: 3.5, fill: "none", stroke: "#2a3a4a", "stroke-width": 1.2 });
                 this._el("line", { x1: eyeX - 6, y1: ey - 4, x2: eyeX + 6, y2: ey + 4, stroke: "#2a3a4a", "stroke-width": 1.5 });
             }
+
+            // Row separator
+            this._el("line", { x1: 0, y1: ry + ROW_H - 1, x2: sidebarWidth, y2: ry + ROW_H - 1, stroke: "#1a2535", "stroke-width": 1 });
         }
     }
 
@@ -1315,6 +1322,83 @@ export class Graph {
             this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: nextIdx }];
             this.setPlayhead(kfs[nextIdx].time);
         }
+    }
+
+    // ─── Sidebar value inputs ─────────────────────────────────────────────────
+
+    private _syncSidebarInputs(): void {
+        if (!this._svgWrapper || !this.config.showSidebar) return;
+        const { sidebarWidth } = this.config;
+        const curves = this.state.data.curves;
+        const ROW_H = 40, START_Y = 30;
+
+        // Create missing inputs
+        while (this._curveValueInputs.length < curves.length) {
+            const ci = this._curveValueInputs.length;
+            const input = document.createElement("input");
+            input.type = "number";
+            input.className = "cv-ns";
+            input.step = "any";
+            input.style.cssText =
+                `position:absolute;left:8px;width:${sidebarWidth - 16}px;height:14px;` +
+                "background:#141b26;color:#8090a8;border:1px solid #1e2d40;border-radius:3px;" +
+                "font-size:10px;font-family:system-ui,sans-serif;text-align:right;" +
+                "padding:0 4px;box-sizing:border-box;outline:none;z-index:10;";
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    const val = parseFloat(input.value);
+                    if (!isNaN(val)) this._setValueAtPlayhead(ci, val);
+                    input.blur();
+                    e.preventDefault();
+                } else if (e.key === "Escape") {
+                    this._refreshCurveValueInput(ci);
+                    input.blur();
+                    e.preventDefault();
+                }
+            });
+            // Prevent SVG mouse events from firing while interacting with the input
+            input.addEventListener("mousedown", (e) => e.stopPropagation());
+            this._svgWrapper!.appendChild(input);
+            this._curveValueInputs.push(input);
+        }
+
+        // Remove excess inputs (curves were deleted)
+        while (this._curveValueInputs.length > curves.length) {
+            this._curveValueInputs.pop()!.remove();
+        }
+
+        // Update position, visibility, and value for each input
+        for (let ci = 0; ci < curves.length; ci++) {
+            const input = this._curveValueInputs[ci];
+            const ry = START_Y + ci * ROW_H;
+            input.style.top = `${ry + 23}px`;
+            input.style.display = "";
+            this._refreshCurveValueInput(ci);
+        }
+    }
+
+    private _refreshCurveValueInput(ci: number): void {
+        const input = this._curveValueInputs[ci];
+        if (!input || document.activeElement === input) return;
+        const val = this._evalCurveAt(ci, this.state.playHead);
+        input.value = parseFloat(val.toFixed(4)).toString();
+    }
+
+    private _setValueAtPlayhead(ci: number, value: number): void {
+        const t = this._snapTime(this.state.playHead);
+        const tolerance = 0.5 / this.config.fps;
+        const curve = this.state.data.curves[ci];
+        const idx = curve.keyframes.findIndex(kf => Math.abs(kf.time - t) <= tolerance);
+        if (idx >= 0) {
+            curve.keyframes[idx].value = value;
+        } else {
+            curve.keyframes.push(mkKf(t, value));
+            curve.keyframes.sort((a, b) => a.time - b.time);
+            const newIdx = curve.keyframes.findIndex(kf => Math.abs(kf.time - t) < 1e-9);
+            if (newIdx >= 0)
+                this.state.selection = [{ kind: "keyframe", curveIdx: ci, kfIdx: newIdx }];
+        }
+        this.redraw();
     }
 
     // ─── Transport bar ────────────────────────────────────────────────────────
